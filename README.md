@@ -53,3 +53,85 @@ Implement a task dependency system that allows tasks to depend on other tasks. T
 3. Submit a link to your repository in the application form.
 
 Thanks for your time and effort. We'll be in touch soon!
+
+## Solution
+
+### Setup
+
+```bash
+npm install
+```
+
+Create a `.env.local` file with your Pexels API key:
+
+```
+PEXELS_API_KEY=your_key_here
+```
+
+Run the development server:
+
+```bash
+npm run dev
+```
+
+### Screenshots
+
+**Task list** — inline image thumbnails, sortable columns, overdue dates in red, critical path badges:
+
+![Task list with due dates and inline images](screenshots/01-task-list.png)
+
+**Expanded row** — larger image preview (click to open full-size dialog), earliest start date, dependency management:
+
+![Expanded row with image preview and dependencies](screenshots/02-expanded-row.png)
+
+**Dependency graph** — interactive React Flow visualization with critical path highlighted in orange:
+
+![Dependency graph with critical path](screenshots/03-dependency-graph.png)
+
+### Part 1: Due Dates
+
+- Added an optional `dueDate` field to the Todo model (Prisma/SQLite).
+- Inline date picker in the task creation row.
+- Sortable due date column in the task table — click to sort ascending/descending.
+- Overdue dates are highlighted in **red** with a warning icon for clear visual distinction.
+
+### Part 2: Image Previews (Pexels API)
+
+- When a todo is created, the server-side API route queries the Pexels API using the task title as a search query.
+- The first matching image URL is stored in the database and displayed as an **inline thumbnail** directly in each task row — visible without any extra clicks.
+- An **animated skeleton placeholder** is shown while each image loads in the browser, with a smooth opacity transition on load.
+- Clicking the thumbnail in the expanded row opens a **full-size preview dialog** (Radix Dialog).
+- An **animated spinner** loading state is shown on the Add button while the task and image are being fetched.
+- The Pexels API key is stored in `.env.local` (server-side only, never exposed to the client).
+
+### Part 3: Task Dependencies
+
+- **Data model**: A `TodoDependency` join table with a unique constraint on `(todoId, dependsOnId)` to prevent duplicate edges.
+- **Multiple dependencies**: Expanding a task row reveals a dependency section with **search-based dependency selector**. The dropdown opens on focus showing all valid options, and supports filtering by typing.
+- **Circular dependency prevention**: Cycle detection runs **both client-side** (DFS reachability — invalid options are filtered out of the selector entirely) **and server-side** (BFS traversal rejects the mutation with a clear error). This provides a seamless UX where users simply cannot select invalid dependencies.
+- **Critical path**: Computed client-side using topological sort (Kahn's algorithm) with a forward pass to find earliest start/finish times, then tracing back from the latest-finishing task to identify the longest path. Critical path tasks are highlighted with an orange badge and row tint.
+- **Earliest start dates**: Calculated for each task based on its dependency chain. Displayed in the expanded row detail for tasks that have dependencies, with a warning about critical path impact.
+- **Interactive dependency graph** (React Flow): Switching to the "Dependencies" tab shows a draggable, zoomable graph with:
+  - Hierarchical left-to-right layout by topological level
+  - Smooth animated edges on the critical path (orange, animated dash)
+  - Non-critical edges dimmed in gray
+  - Draggable nodes with zoom/pan controls
+  - Critical path summary badge strip below the graph
+
+### Beyond the Requirements
+
+- **Task completion**: Click the circle icon to mark tasks done. Completed tasks show with strikethrough text and muted styling. Overdue indicators are hidden for completed tasks.
+- **Status filters**: Filter by All / Pending / Completed with live counts. Filter state is persisted in the URL via **nuqs** for shareability (e.g. `?status=pending&tab=dependencies`).
+- **Multi-select dependencies**: Select multiple dependency targets at once with checkboxes, then confirm with a single "Add N dependencies" button.
+- **Server Components + Server Actions**: The page is a server component that fetches data server-side (no client-side waterfall). All mutations run as server actions. REST API routes are also available for programmatic access.
+- **Optimistic UI**: Toggling task completion updates instantly before the server round-trip.
+
+### Tech Choices
+
+- **Server Components + Server Actions**: Data fetching via Prisma with no client-side waterfall; only interactive leaves are client components
+- **shadcn/ui** (Radix + Tailwind + CVA): Consistent, accessible component library (Button, Badge, Tabs, Dialog)
+- **React Flow**: Interactive dependency graph with pan/zoom, drag, and animated edges
+- **nuqs**: Tab and filter state persisted in the URL for shareability
+- **Prisma + SQLite**: Simple relational backend with typed ORM
+- **Pure graph functions** (`lib/graph.ts`): Topological sort, critical path, and reachability as testable pure functions
+- **Lucide icons**: Consistent iconography throughout

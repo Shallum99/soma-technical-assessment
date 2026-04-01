@@ -22,3 +22,30 @@ export async function DELETE(request: Request, { params }: Params) {
     return NextResponse.json({ error: 'Error deleting todo' }, { status: 500 });
   }
 }
+
+export async function PATCH(request: Request, { params }: Params) {
+  const id = parseInt(params.id);
+  if (isNaN(id)) {
+    return NextResponse.json({ error: 'Invalid ID' }, { status: 400 });
+  }
+
+  try {
+    const body = await request.json();
+    const data: { title?: string; completed?: boolean; dueDate?: Date | null } = {};
+    if (body.title !== undefined) data.title = body.title;
+    if (body.completed !== undefined) data.completed = body.completed;
+    if (body.dueDate !== undefined) data.dueDate = body.dueDate ? new Date(body.dueDate + "T12:00:00") : null;
+
+    const todo = await prisma.todo.update({
+      where: { id },
+      data,
+      include: {
+        dependsOn: { include: { dependsOn: true } },
+        dependedBy: { include: { todo: true } },
+      },
+    });
+    return NextResponse.json(todo);
+  } catch (error) {
+    return NextResponse.json({ error: 'Error updating todo' }, { status: 500 });
+  }
+}
