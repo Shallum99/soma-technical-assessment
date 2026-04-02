@@ -160,7 +160,7 @@ npm test
 
 ### Testing
 
-30 unit tests covering the graph algorithm library (`lib/graph.ts`):
+31 unit tests covering the graph algorithm library (`lib/graph.ts`):
 
 - **`topologicalSort`** — empty input, single node, linear chains, diamond dependencies, cycles, multiple independent chains, multi-dependency nodes
 - **`canReach`** — direct edges, transitive paths, unreachable nodes, reverse direction, cycle handling

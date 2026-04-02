@@ -37,6 +37,9 @@ export async function PATCH(request: Request, { params }: Params) {
       if (typeof body.title !== 'string' || body.title.trim() === '') {
         return NextResponse.json({ error: 'Title cannot be empty' }, { status: 400 });
       }
+      if (body.title.length > 500) {
+        return NextResponse.json({ error: 'Title must be 500 characters or fewer' }, { status: 400 });
+      }
       data.title = body.title.trim();
     }
     if (body.completed !== undefined) data.completed = body.completed;
