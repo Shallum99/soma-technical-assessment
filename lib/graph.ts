@@ -53,6 +53,19 @@ export interface GraphAnalysis {
   criticalPath: number[];
 }
 
+function inferProjectStart(todos: TodoNode[]): Date {
+  let earliest = new Date(todos[0].createdAt);
+
+  for (const todo of todos) {
+    const createdAt = new Date(todo.createdAt);
+    if (!Number.isNaN(createdAt.getTime()) && createdAt < earliest) {
+      earliest = createdAt;
+    }
+  }
+
+  return earliest;
+}
+
 /**
  * Forward-pass schedule + critical path computation.
  *
@@ -61,7 +74,7 @@ export interface GraphAnalysis {
  */
 export function analyzeGraph(
   todos: TodoNode[],
-  projectStart: Date = new Date()
+  projectStart?: Date
 ): GraphAnalysis {
   const empty: GraphAnalysis = {
     earliestStart: new Map(),
@@ -75,6 +88,7 @@ export function analyzeGraph(
 
   const sorted = topologicalSort(todos);
   if (!sorted) return empty;
+  const baseline = projectStart ?? inferProjectStart(todos);
 
   // Forward pass: compute earliest start/finish for each task.
   // Root tasks all share the same baseline so the critical path
@@ -84,7 +98,7 @@ export function analyzeGraph(
 
   for (const id of sorted) {
     const todo = todoMap.get(id)!;
-    let es = projectStart;
+    let es = baseline;
 
     for (const dep of todo.dependsOn) {
       const depFinish = earliestFinish.get(dep.dependsOnId);
@@ -110,7 +124,7 @@ export function analyzeGraph(
   const criticalPath: number[] = [];
   let traceId: number | null = latestFinishId;
   while (traceId !== null) {
-    criticalPath.unshift(traceId);
+    criticalPath.push(traceId);
     const traceNode: TodoNode = todoMap.get(traceId)!;
     if (traceNode.dependsOn.length === 0) break;
 
@@ -125,6 +139,7 @@ export function analyzeGraph(
     }
     traceId = criticalPred;
   }
+  criticalPath.reverse();
 
   return { earliestStart, earliestFinish, criticalPath };
 }

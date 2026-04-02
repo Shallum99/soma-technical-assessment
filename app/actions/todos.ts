@@ -1,11 +1,14 @@
 "use server";
 
 import { prisma } from "@/lib/prisma";
-import { searchPexelsImage } from "@/lib/pexels";
 import { revalidatePath } from "next/cache";
 import { wouldCreateCycle } from "@/lib/graph";
-
-const MAX_TITLE_LENGTH = 500;
+import { startTodoImageFetch } from "@/lib/todo-images";
+import {
+  validateCreateTodoInput,
+  validateDependencyId,
+  validateDependencyIds,
+} from "@/lib/todo-validation";
 
 const todoInclude = {
   dependsOn: { include: { dependsOn: true } },
@@ -20,52 +23,47 @@ export async function getTodos() {
 }
 
 export async function createTodo(title: string, dueDate: string | null) {
-  if (!title || title.trim() === "") {
-    return { error: "Title is required" };
-  }
-  if (title.length > MAX_TITLE_LENGTH) {
-    return { error: `Title must be ${MAX_TITLE_LENGTH} characters or fewer` };
+  const validated = validateCreateTodoInput(title, dueDate);
+  if (!validated.ok) {
+    return { error: validated.error };
   }
 
-  // Create the todo immediately WITHOUT waiting for Pexels.
-  // The image is fetched separately via loadTodoImage so the
-  // todo item can show a loading state in the UI.
   const todo = await prisma.todo.create({
     data: {
-      title: title.trim(),
-      dueDate: dueDate ? new Date(dueDate + "T23:59:59") : null,
+      title: validated.value.title,
+      dueDate: validated.value.dueDate,
     },
     include: todoInclude,
   });
 
+  startTodoImageFetch(todo.id, validated.value.title);
   revalidatePath("/");
   return { todo };
 }
 
-/** Fetch a Pexels image for an existing todo and persist it. */
-export async function loadTodoImage(todoId: number, query: string) {
-  const imageUrl = await searchPexelsImage(query.trim());
-  if (imageUrl) {
-    await prisma.todo.update({
-      where: { id: todoId },
-      data: { imageUrl },
-    });
-  }
-  revalidatePath("/");
-  return { imageUrl };
-}
-
 export async function deleteTodo(id: number) {
+  if (!Number.isInteger(id) || id <= 0) {
+    return { error: "Invalid task ID" };
+  }
   try {
     await prisma.todo.delete({ where: { id } });
     revalidatePath("/");
     return {};
-  } catch {
+  } catch (e: unknown) {
+    if (e && typeof e === "object" && "code" in e && e.code === "P2025") {
+      return { error: "Task not found" };
+    }
     return { error: "Failed to delete task" };
   }
 }
 
 export async function toggleTodo(id: number, completed: boolean) {
+  if (!Number.isInteger(id) || id <= 0) {
+    return { error: "Invalid task ID" };
+  }
+  if (typeof completed !== "boolean") {
+    return { error: "Completed must be a boolean" };
+  }
   try {
     await prisma.todo.update({
       where: { id },
@@ -73,19 +71,29 @@ export async function toggleTodo(id: number, completed: boolean) {
     });
     revalidatePath("/");
     return {};
-  } catch {
+  } catch (e: unknown) {
+    if (e && typeof e === "object" && "code" in e && e.code === "P2025") {
+      return { error: "Task not found" };
+    }
     return { error: "Failed to update task" };
   }
 }
 
 export async function addDependency(todoId: number, dependsOnId: number) {
-  if (todoId === dependsOnId) {
+  if (!Number.isInteger(todoId) || todoId <= 0) {
+    return { error: "Invalid task ID" };
+  }
+  const validatedDep = validateDependencyId(dependsOnId);
+  if (!validatedDep.ok) return { error: validatedDep.error };
+  const dependencyId = validatedDep.value;
+
+  if (todoId === dependencyId) {
     return { error: "A task cannot depend on itself" };
   }
 
   const [todo, dep] = await Promise.all([
     prisma.todo.findUnique({ where: { id: todoId } }),
-    prisma.todo.findUnique({ where: { id: dependsOnId } }),
+    prisma.todo.findUnique({ where: { id: dependencyId } }),
   ]);
   if (!todo || !dep) return { error: "Todo not found" };
 
@@ -94,7 +102,7 @@ export async function addDependency(todoId: number, dependsOnId: number) {
     select: { todoId: true, dependsOnId: true },
   });
 
-  if (wouldCreateCycle(todoId, dependsOnId, allEdges)) {
+  if (wouldCreateCycle(todoId, dependencyId, allEdges)) {
     return {
       error: "Adding this dependency would create a circular reference",
     };
@@ -102,7 +110,7 @@ export async function addDependency(todoId: number, dependsOnId: number) {
 
   try {
     await prisma.todoDependency.create({
-      data: { todoId, dependsOnId },
+      data: { todoId, dependsOnId: dependencyId },
     });
   } catch (e: unknown) {
     if (e && typeof e === "object" && "code" in e && e.code === "P2002") {
@@ -116,16 +124,51 @@ export async function addDependency(todoId: number, dependsOnId: number) {
 }
 
 export async function removeDependency(todoId: number, dependsOnId: number) {
-  await prisma.todoDependency.deleteMany({
-    where: { todoId, dependsOnId },
-  });
-  revalidatePath("/");
+  if (!Number.isInteger(todoId) || todoId <= 0) {
+    return { error: "Invalid task ID" };
+  }
+  const validatedDep = validateDependencyId(dependsOnId);
+  if (!validatedDep.ok) return { error: validatedDep.error };
+  const dependencyId = validatedDep.value;
+
+  try {
+    const result = await prisma.todoDependency.deleteMany({
+      where: { todoId, dependsOnId: dependencyId },
+    });
+    if (result.count === 0) {
+      return { error: "Dependency not found" };
+    }
+    revalidatePath("/");
+    return {};
+  } catch {
+    return { error: "Failed to remove dependency" };
+  }
 }
 
 export async function addMultipleDependencies(
   todoId: number,
   dependsOnIds: number[]
 ) {
+  if (!Number.isInteger(todoId) || todoId <= 0) {
+    return [{ id: -1, error: "Invalid task ID" }];
+  }
+
+  const validatedDepIds = validateDependencyIds(dependsOnIds);
+  if (!validatedDepIds.ok) {
+    return [{ id: -1, error: validatedDepIds.error }];
+  }
+
+  const dependencyIds = validatedDepIds.value;
+
+  const existingTodos = await prisma.todo.findMany({
+    where: { id: { in: [todoId, ...dependencyIds] } },
+    select: { id: true },
+  });
+  const existingIds = new Set(existingTodos.map((todo) => todo.id));
+  if (!existingIds.has(todoId)) {
+    return [{ id: todoId, error: "Todo not found" }];
+  }
+
   // Load all edges once for every cycle check in this batch
   const allEdges = await prisma.todoDependency.findMany({
     select: { todoId: true, dependsOnId: true },
@@ -135,9 +178,14 @@ export async function addMultipleDependencies(
   // Track edges as we add them so subsequent checks see prior additions
   const currentEdges = [...allEdges];
 
-  for (const depId of dependsOnIds) {
+  for (const depId of dependencyIds) {
     if (todoId === depId) {
       results.push({ id: depId, error: "A task cannot depend on itself" });
+      continue;
+    }
+
+    if (!existingIds.has(depId)) {
+      results.push({ id: depId, error: "Todo not found" });
       continue;
     }
 

@@ -36,7 +36,6 @@ import { DependencyGraph } from "@/components/dependency-graph";
 import { analyzeGraph, canReach } from "@/lib/graph";
 import {
   createTodo,
-  loadTodoImage,
   deleteTodo,
   toggleTodo,
   removeDependency,
@@ -47,16 +46,56 @@ import type { Todo, SortField, SortDir } from "@/lib/types";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/** Due date is past the current time — stored as end-of-day so this
- *  triggers the morning after the due date. */
-const isOverdue = (d: string) => new Date(d) < new Date();
+function parseStoredDate(d: string) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(d);
+  if (!match) return null;
 
-const formatDate = (d: string) =>
-  new Date(d).toLocaleDateString("en-US", {
+  const [, year, month, day] = match;
+  return {
+    year: Number(year),
+    month: Number(month),
+    day: Number(day),
+  };
+}
+
+/**
+ * Due dates are chosen as calendar days, so overdue status should flip after
+ * the end of that local day rather than based on the stored UTC timestamp.
+ */
+const isOverdue = (d: string) => {
+  const parsed = parseStoredDate(d);
+  if (!parsed) return new Date(d) < new Date();
+
+  const dueEndOfDay = new Date(
+    parsed.year,
+    parsed.month - 1,
+    parsed.day,
+    23,
+    59,
+    59,
+    999
+  );
+  return dueEndOfDay.getTime() < Date.now();
+};
+
+const formatDate = (d: string) => {
+  const parsed = parseStoredDate(d);
+  const date = parsed
+    ? new Date(parsed.year, parsed.month - 1, parsed.day)
+    : new Date(d);
+
+  return date.toLocaleDateString("en-US", {
     month: "short",
     day: "numeric",
     year: "numeric",
   });
+};
+
+const dueDateSortValue = (d: string) => {
+  const parsed = parseStoredDate(d);
+  if (!parsed) return new Date(d).getTime();
+  return Date.UTC(parsed.year, parsed.month - 1, parsed.day);
+};
 
 const formatDateTime = (d: Date) =>
   d.toLocaleDateString("en-US", {
@@ -202,6 +241,13 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
     new Set()
   );
   const [isPending, startTransition] = useTransition();
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   // nuqs — URL-persisted state
   const [tab, setTab] = useQueryState("tab", { defaultValue: "tasks" });
@@ -213,11 +259,44 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
   const refresh = useCallback(async () => {
     try {
       const data = await getTodos();
-      setTodos(JSON.parse(JSON.stringify(data)));
+      const serialized = JSON.parse(JSON.stringify(data)) as Todo[];
+      if (mountedRef.current) {
+        setTodos(serialized);
+      }
+      return serialized;
     } catch (e) {
       console.error("Failed to refresh todos:", e);
+      return null;
     }
   }, []);
+
+  const stopImageLoading = useCallback((todoId: number) => {
+    setImageLoadingIds((prev) => {
+      if (!prev.has(todoId)) return prev;
+      const next = new Set(prev);
+      next.delete(todoId);
+      return next;
+    });
+  }, []);
+
+  const waitForTodoImage = useCallback(
+    async (todoId: number) => {
+      for (let attempt = 0; attempt < 6; attempt++) {
+        if (!mountedRef.current) return;
+        await new Promise((resolve) =>
+          setTimeout(resolve, attempt === 0 ? 500 : 1000)
+        );
+        if (!mountedRef.current) return;
+
+        const latest = await refresh();
+        const todo = latest?.find((item) => item.id === todoId);
+        if (!todo || todo.imageUrl) break;
+      }
+
+      if (mountedRef.current) stopImageLoading(todoId);
+    },
+    [refresh, stopImageLoading]
+  );
 
   // Close dep dropdown on click outside
   const depDropdownRef = useRef<HTMLDivElement>(null);
@@ -242,9 +321,18 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
   }, [expandedId]);
 
   // ── Graph analysis ─────────────────────────────────────────────────────────
+  const projectStart = useMemo(() => {
+    if (todos.length === 0) return new Date();
+
+    return todos.reduce((earliest, todo) => {
+      const createdAt = new Date(todo.createdAt);
+      return createdAt < earliest ? createdAt : earliest;
+    }, new Date(todos[0].createdAt));
+  }, [todos]);
+
   const { earliestStart, criticalPath } = useMemo(
-    () => analyzeGraph(todos),
-    [todos]
+    () => analyzeGraph(todos, projectStart),
+    [todos, projectStart]
   );
   const criticalSet = useMemo(() => new Set(criticalPath), [criticalPath]);
 
@@ -296,8 +384,8 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
       if (sortField === "title") {
         cmp = a.title.localeCompare(b.title);
       } else if (sortField === "dueDate") {
-        const ad = a.dueDate ? new Date(a.dueDate).getTime() : Infinity;
-        const bd = b.dueDate ? new Date(b.dueDate).getTime() : Infinity;
+        const ad = a.dueDate ? dueDateSortValue(a.dueDate) : Infinity;
+        const bd = b.dueDate ? dueDateSortValue(b.dueDate) : Infinity;
         cmp = ad - bd;
       } else {
         cmp =
@@ -308,8 +396,14 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
     return copy;
   }, [filteredTodos, sortField, sortDir]);
 
-  const pendingCount = todos.filter((t) => !t.completed).length;
-  const completedCount = todos.filter((t) => t.completed).length;
+  const pendingCount = useMemo(
+    () => todos.filter((t) => !t.completed).length,
+    [todos]
+  );
+  const completedCount = useMemo(
+    () => todos.filter((t) => t.completed).length,
+    [todos]
+  );
 
   // ── Handlers ───────────────────────────────────────────────────────────────
   const handleSort = (field: SortField) => {
@@ -340,21 +434,14 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
 
       // Show the new todo immediately with an image loading skeleton
       setImageLoadingIds((prev) => new Set(prev).add(todoId));
-      await refresh();
+      const latest = await refresh();
+      const createdTodo = latest?.find((todo) => todo.id === todoId);
 
-      // Fetch image in the background — the todo item shows a
-      // loading state in the meantime (satisfies Part 2 spec).
-      try {
-        await loadTodoImage(todoId, title);
-      } catch {
-        // Image fetch failure is non-critical
+      if (createdTodo?.imageUrl) {
+        stopImageLoading(todoId);
+      } else {
+        void waitForTodoImage(todoId);
       }
-      setImageLoadingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(todoId);
-        return next;
-      });
-      await refresh();
     } catch {
       setError("Failed to add todo.");
       setLoading(false);
@@ -423,7 +510,11 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
   const handleRemoveDep = async (todoId: number, depId: number) => {
     setDepLoading(true);
     try {
-      await removeDependency(todoId, depId);
+      const result = await removeDependency(todoId, depId);
+      if (result.error) {
+        setError(result.error);
+        return;
+      }
       await refresh();
     } catch {
       setError("Failed to remove dependency.");

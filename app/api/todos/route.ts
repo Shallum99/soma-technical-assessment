@@ -2,9 +2,8 @@
 // but these routes are kept for external/programmatic access (e.g. seed script).
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { searchPexelsImage } from '@/lib/pexels';
-
-const MAX_TITLE_LENGTH = 500;
+import { startTodoImageFetch } from '@/lib/todo-images';
+import { validateCreateTodoInput } from '@/lib/todo-validation';
 
 const todoInclude = {
   dependsOn: { include: { dependsOn: true } },
@@ -24,37 +23,30 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  let body: unknown;
   try {
-    const { title, dueDate } = await request.json();
-    if (!title || typeof title !== 'string' || title.trim() === '') {
-      return NextResponse.json({ error: 'Title is required' }, { status: 400 });
-    }
-    if (title.length > MAX_TITLE_LENGTH) {
-      return NextResponse.json(
-        { error: `Title must be ${MAX_TITLE_LENGTH} characters or fewer` },
-        { status: 400 }
-      );
-    }
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+  }
 
-    const trimmed = title.trim();
+  try {
+    const { title, dueDate } = body as Record<string, unknown>;
+
+    const validated = validateCreateTodoInput(title, dueDate);
+    if (!validated.ok) {
+      return NextResponse.json({ error: validated.error }, { status: 400 });
+    }
 
     const todo = await prisma.todo.create({
       data: {
-        title: trimmed,
-        dueDate: dueDate ? new Date(dueDate + "T23:59:59") : null,
+        title: validated.value.title,
+        dueDate: validated.value.dueDate,
       },
       include: todoInclude,
     });
 
-    // Fire-and-forget image fetch so the response returns immediately
-    searchPexelsImage(trimmed).then(async (imageUrl) => {
-      if (imageUrl) {
-        await prisma.todo.update({
-          where: { id: todo.id },
-          data: { imageUrl },
-        });
-      }
-    }).catch(() => {});
+    startTodoImageFetch(todo.id, validated.value.title);
 
     return NextResponse.json(todo, { status: 201 });
   } catch {

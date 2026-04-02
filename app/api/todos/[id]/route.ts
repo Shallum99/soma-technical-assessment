@@ -1,5 +1,9 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import {
+  validateNumericId,
+  validateUpdateTodoInput,
+} from '@/lib/todo-validation';
 
 interface Params {
   params: {
@@ -8,55 +12,58 @@ interface Params {
 }
 
 export async function DELETE(request: Request, { params }: Params) {
-  const id = parseInt(params.id);
-  if (isNaN(id)) {
+  const validatedId = validateNumericId(params.id);
+  if (!validatedId.ok) {
     return NextResponse.json({ error: 'Invalid ID' }, { status: 400 });
   }
+  const id = validatedId.value;
 
   try {
     await prisma.todo.delete({
       where: { id },
     });
     return NextResponse.json({ message: 'Todo deleted' }, { status: 200 });
-  } catch {
+  } catch (e: unknown) {
+    if (e && typeof e === 'object' && 'code' in e && e.code === 'P2025') {
+      return NextResponse.json({ error: 'Todo not found' }, { status: 404 });
+    }
     return NextResponse.json({ error: 'Error deleting todo' }, { status: 500 });
   }
 }
 
 export async function PATCH(request: Request, { params }: Params) {
-  const id = parseInt(params.id);
-  if (isNaN(id)) {
+  const validatedId = validateNumericId(params.id);
+  if (!validatedId.ok) {
     return NextResponse.json({ error: 'Invalid ID' }, { status: 400 });
+  }
+  const id = validatedId.value;
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
   try {
-    const body = await request.json();
-    const data: { title?: string; completed?: boolean; dueDate?: Date | null } = {};
-
-    if (body.title !== undefined) {
-      if (typeof body.title !== 'string' || body.title.trim() === '') {
-        return NextResponse.json({ error: 'Title cannot be empty' }, { status: 400 });
-      }
-      if (body.title.length > 500) {
-        return NextResponse.json({ error: 'Title must be 500 characters or fewer' }, { status: 400 });
-      }
-      data.title = body.title.trim();
-    }
-    if (body.completed !== undefined) data.completed = body.completed;
-    if (body.dueDate !== undefined) {
-      data.dueDate = body.dueDate ? new Date(body.dueDate + "T23:59:59") : null;
+    const validated = validateUpdateTodoInput(body);
+    if (!validated.ok) {
+      return NextResponse.json({ error: validated.error }, { status: 400 });
     }
 
     const todo = await prisma.todo.update({
       where: { id },
-      data,
+      data: validated.value,
       include: {
         dependsOn: { include: { dependsOn: true } },
         dependedBy: { include: { todo: true } },
       },
     });
     return NextResponse.json(todo);
-  } catch {
+  } catch (e: unknown) {
+    if (e && typeof e === 'object' && 'code' in e && e.code === 'P2025') {
+      return NextResponse.json({ error: 'Todo not found' }, { status: 404 });
+    }
     return NextResponse.json({ error: 'Error updating todo' }, { status: 500 });
   }
 }

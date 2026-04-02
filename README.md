@@ -120,7 +120,7 @@ npm test
 
 ### Part 2: Image Previews (Pexels API)
 
-- Todo creation is a two-step process: the task row is inserted and returned immediately, then the Pexels image is fetched asynchronously via a separate `loadTodoImage` server action. This keeps creation fast and allows the **todo item itself** to display an animated skeleton placeholder while the image search runs.
+- Todo creation inserts the task row immediately, then kicks off the Pexels lookup on the server in the background. This keeps creation fast and allows the **todo item itself** to display an animated skeleton placeholder while the image search runs.
 - Once the Pexels response arrives, the image URL is persisted and the UI refreshes to show the inline thumbnail.
 - Clicking the thumbnail in the expanded row opens a **full-size preview dialog** (Radix Dialog).
 - The Pexels fetch has a **5-second timeout** so task creation is never blocked indefinitely by an external API.
@@ -160,12 +160,13 @@ npm test
 
 ### Testing
 
-31 unit tests covering the graph algorithm library (`lib/graph.ts`):
+Vitest unit tests cover the graph algorithm library plus shared todo-validation helpers:
 
 - **`topologicalSort`** — empty input, single node, linear chains, diamond dependencies, cycles, multiple independent chains, multi-dependency nodes
 - **`canReach`** — direct edges, transitive paths, unreachable nodes, reverse direction, cycle handling
 - **`wouldCreateCycle`** — no edges, direct back-edges, transitive cycles, parallel chains, diamond cycles
-- **`analyzeGraph`** — empty input, single-node critical path, linear chains, earliest start calculation, diamond path selection, longer branch selection, cyclic input, independent tasks, fixed baseline verification, proof that later-created independent tasks cannot steal the critical path from a dependency chain
+- **`analyzeGraph`** — empty input, single-node critical path, linear chains, earliest start calculation, default baseline inference, diamond path selection, longer branch selection, cyclic input, independent tasks, fixed baseline verification, proof that later-created independent tasks cannot steal the critical path from a dependency chain
+- **`todo-validation`** — create/update payload validation, due-date parsing, and ID/dependency validation
 
 ```bash
 npm test          # run once
@@ -189,6 +190,8 @@ components/
 
 lib/
   graph.ts              Pure functions: topologicalSort, analyzeGraph, canReach, wouldCreateCycle
+  todo-images.ts        Server-side background Pexels fetch + persistence helper
+  todo-validation.ts    Shared validation/parsing helpers for actions and routes
   types.ts              Shared TypeScript interfaces (Todo, SortField, SortDir)
   prisma.ts             Prisma client singleton
   pexels.ts             Pexels API integration
@@ -198,7 +201,8 @@ prisma/
   schema.prisma         Todo + TodoDependency models with cascade deletes
 
 __tests__/
-  graph.test.ts         30 tests for graph algorithms (vitest)
+  graph.test.ts         Graph algorithm tests (vitest)
+  todo-validation.test.ts Shared validation helper tests (vitest)
 ```
 
 ### Tech Stack

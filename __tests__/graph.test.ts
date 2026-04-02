@@ -203,6 +203,24 @@ describe("analyzeGraph", () => {
     expect(result.earliestStart.get(3)!.getTime()).toBe(startTime + 2 * DAY);
   });
 
+  it("uses the earliest createdAt as the default project baseline", () => {
+    const todos = [
+      {
+        ...node(1),
+        createdAt: "2024-02-01T00:00:00.000Z",
+      },
+      {
+        ...node(2, [1]),
+        createdAt: "2024-03-01T00:00:00.000Z",
+      },
+    ];
+    const result = analyzeGraph(todos);
+    const inferredStart = new Date("2024-02-01T00:00:00.000Z").getTime();
+
+    expect(result.earliestStart.get(1)!.getTime()).toBe(inferredStart);
+    expect(result.earliestStart.get(2)!.getTime()).toBe(inferredStart + DAY);
+  });
+
   it("all root tasks share the same baseline regardless of createdAt", () => {
     // Task 1 was created much later than task 2 — should not matter.
     const todos = [

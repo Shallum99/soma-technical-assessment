@@ -1,6 +1,10 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { wouldCreateCycle } from '@/lib/graph';
+import {
+  validateDependencyId,
+  validateNumericId,
+} from '@/lib/todo-validation';
 
 interface Params {
   params: {
@@ -9,26 +13,35 @@ interface Params {
 }
 
 export async function POST(request: Request, { params }: Params) {
-  const todoId = parseInt(params.id);
-  if (isNaN(todoId)) {
+  const validatedTodoId = validateNumericId(params.id);
+  if (!validatedTodoId.ok) {
     return NextResponse.json({ error: 'Invalid ID' }, { status: 400 });
+  }
+  const todoId = validatedTodoId.value;
+
+  let body: Record<string, unknown>;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
   try {
-    const { dependsOnId } = await request.json();
-
-    if (!dependsOnId || typeof dependsOnId !== 'number') {
-      return NextResponse.json({ error: 'dependsOnId is required' }, { status: 400 });
+    const { dependsOnId } = body;
+    const validatedDependencyId = validateDependencyId(dependsOnId);
+    if (!validatedDependencyId.ok) {
+      return NextResponse.json({ error: validatedDependencyId.error }, { status: 400 });
     }
+    const dependencyId = validatedDependencyId.value;
 
-    if (todoId === dependsOnId) {
+    if (todoId === dependencyId) {
       return NextResponse.json({ error: 'A task cannot depend on itself' }, { status: 400 });
     }
 
     // Verify both todos exist
     const [todo, depTodo] = await Promise.all([
       prisma.todo.findUnique({ where: { id: todoId } }),
-      prisma.todo.findUnique({ where: { id: dependsOnId } }),
+      prisma.todo.findUnique({ where: { id: dependencyId } }),
     ]);
 
     if (!todo || !depTodo) {
@@ -40,7 +53,7 @@ export async function POST(request: Request, { params }: Params) {
       select: { todoId: true, dependsOnId: true },
     });
 
-    if (wouldCreateCycle(todoId, dependsOnId, allEdges)) {
+    if (wouldCreateCycle(todoId, dependencyId, allEdges)) {
       return NextResponse.json(
         { error: 'Adding this dependency would create a circular reference' },
         { status: 400 }
@@ -48,7 +61,7 @@ export async function POST(request: Request, { params }: Params) {
     }
 
     const dependency = await prisma.todoDependency.create({
-      data: { todoId, dependsOnId },
+      data: { todoId, dependsOnId: dependencyId },
       include: { dependsOn: true },
     });
 
@@ -62,17 +75,34 @@ export async function POST(request: Request, { params }: Params) {
 }
 
 export async function DELETE(request: Request, { params }: Params) {
-  const todoId = parseInt(params.id);
-  if (isNaN(todoId)) {
+  const validatedTodoId = validateNumericId(params.id);
+  if (!validatedTodoId.ok) {
     return NextResponse.json({ error: 'Invalid ID' }, { status: 400 });
+  }
+  const todoId = validatedTodoId.value;
+
+  let body: Record<string, unknown>;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
   try {
-    const { dependsOnId } = await request.json();
+    const { dependsOnId } = body;
+    const validatedDependencyId = validateDependencyId(dependsOnId);
+    if (!validatedDependencyId.ok) {
+      return NextResponse.json({ error: validatedDependencyId.error }, { status: 400 });
+    }
+    const dependencyId = validatedDependencyId.value;
 
-    await prisma.todoDependency.deleteMany({
-      where: { todoId, dependsOnId },
+    const result = await prisma.todoDependency.deleteMany({
+      where: { todoId, dependsOnId: dependencyId },
     });
+
+    if (result.count === 0) {
+      return NextResponse.json({ error: 'Dependency not found' }, { status: 404 });
+    }
 
     return NextResponse.json({ message: 'Dependency removed' });
   } catch {
