@@ -1,4 +1,3 @@
-import { revalidatePath } from "next/cache";
 import { prisma } from "@/lib/prisma";
 import { searchPexelsImage } from "@/lib/pexels";
 
@@ -18,7 +17,6 @@ export async function fetchAndStoreTodoImage(todoId: number, query: string) {
     return null;
   }
 
-  revalidatePath("/");
   return imageUrl;
 }
 

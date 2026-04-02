@@ -4,7 +4,6 @@ import {
   useEffect,
   useMemo,
   useCallback,
-  useTransition,
   useRef,
 } from "react";
 import { useQueryState } from "nuqs";
@@ -34,14 +33,6 @@ import {
 } from "@/components/ui/dialog";
 import { DependencyGraph } from "@/components/dependency-graph";
 import { analyzeGraph, canReach } from "@/lib/graph";
-import {
-  createTodo,
-  deleteTodo,
-  toggleTodo,
-  removeDependency,
-  addMultipleDependencies,
-  getTodos,
-} from "@/app/actions/todos";
 import type { Todo, SortField, SortDir } from "@/lib/types";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -78,7 +69,9 @@ const isOverdue = (d: string) => {
   return dueEndOfDay.getTime() < Date.now();
 };
 
-const formatDate = (d: string) => {
+/** Format a due date — extracts UTC date components so the displayed
+ *  calendar day always matches what the user picked, regardless of timezone. */
+const formatDueDate = (d: string) => {
   const parsed = parseStoredDate(d);
   const date = parsed
     ? new Date(parsed.year, parsed.month - 1, parsed.day)
@@ -90,6 +83,14 @@ const formatDate = (d: string) => {
     year: "numeric",
   });
 };
+
+/** Format a timestamp (like createdAt) using the browser's local timezone. */
+const formatDate = (d: string) =>
+  new Date(d).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
 
 const dueDateSortValue = (d: string) => {
   const parsed = parseStoredDate(d);
@@ -213,7 +214,11 @@ function TodoThumbnail({
     );
   }
   if (isImageLoading) {
-    return <div className="w-10 h-10 bg-gray-200 animate-pulse rounded" />;
+    return (
+      <div className="w-10 h-10 bg-gray-100 rounded flex items-center justify-center">
+        <Loader2 className="h-5 w-5 text-gray-400 animate-spin" />
+      </div>
+    );
   }
   return (
     <div className="w-10 h-10 bg-gray-100 rounded flex items-center justify-center">
@@ -240,7 +245,6 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
   const [imageLoadingIds, setImageLoadingIds] = useState<Set<number>>(
     new Set()
   );
-  const [isPending, startTransition] = useTransition();
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -255,15 +259,16 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
     defaultValue: "all",
   });
 
-  // Refresh data from server
+  // Refresh data from server via REST API (avoids server action serialization issues)
   const refresh = useCallback(async () => {
     try {
-      const data = await getTodos();
-      const serialized = JSON.parse(JSON.stringify(data)) as Todo[];
+      const res = await fetch("/api/todos");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as Todo[];
       if (mountedRef.current) {
-        setTodos(serialized);
+        setTodos(data);
       }
-      return serialized;
+      return data;
     } catch (e) {
       console.error("Failed to refresh todos:", e);
       return null;
@@ -278,25 +283,6 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
       return next;
     });
   }, []);
-
-  const waitForTodoImage = useCallback(
-    async (todoId: number) => {
-      for (let attempt = 0; attempt < 6; attempt++) {
-        if (!mountedRef.current) return;
-        await new Promise((resolve) =>
-          setTimeout(resolve, attempt === 0 ? 500 : 1000)
-        );
-        if (!mountedRef.current) return;
-
-        const latest = await refresh();
-        const todo = latest?.find((item) => item.id === todoId);
-        if (!todo || todo.imageUrl) break;
-      }
-
-      if (mountedRef.current) stopImageLoading(todoId);
-    },
-    [refresh, stopImageLoading]
-  );
 
   // Close dep dropdown on click outside
   const depDropdownRef = useRef<HTMLDivElement>(null);
@@ -421,50 +407,47 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
     setLoading(true);
     setError(null);
     try {
-      const result = await createTodo(title, newDueDate || null);
-      if ("error" in result) {
-        setError(result.error!);
+      const res = await fetch("/api/todos", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, dueDate: newDueDate || null }),
+      });
+      const todo = await res.json();
+      if (!res.ok) {
+        setError(todo.error || "Failed to add todo.");
         setLoading(false);
         return;
       }
-      const todoId = result.todo.id;
       setNewTitle("");
       setNewDueDate("");
+      setTodos((prev) => [todo, ...prev]);
+      setImageLoadingIds((prev) => new Set(prev).add(todo.id));
       setLoading(false);
 
-      // Show the new todo immediately with an image loading skeleton
-      setImageLoadingIds((prev) => new Set(prev).add(todoId));
-      const latest = await refresh();
-      const createdTodo = latest?.find((todo) => todo.id === todoId);
-
-      if (createdTodo?.imageUrl) {
-        stopImageLoading(todoId);
-      } else {
-        void waitForTodoImage(todoId);
-      }
+      // Reload after Pexels image has had time to save (~3s)
+      window.setTimeout(() => window.location.reload(), 3000);
     } catch {
       setError("Failed to add todo.");
       setLoading(false);
     }
   };
 
+  const reloadAfterMutation = () => window.location.reload();
+
   const handleToggle = (id: number, completed: boolean) => {
-    // Optimistic update — rollback the specific field on failure,
-    // not a stale snapshot, so overlapping toggles are safe.
+    // Optimistic update
     setTodos((prev) =>
       prev.map((t) => (t.id === id ? { ...t, completed } : t))
     );
-    startTransition(async () => {
-      const result = await toggleTodo(id, completed);
-      if (result.error) {
-        setTodos((prev) =>
-          prev.map((t) => (t.id === id ? { ...t, completed: !completed } : t))
-        );
-        setError(result.error);
-        return;
-      }
-      await refresh();
-    });
+    fetch(`/api/todos/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ completed }),
+    })
+      .then((res) => {
+        if (!res.ok) reloadAfterMutation();
+      })
+      .catch(() => reloadAfterMutation());
   };
 
   const handleDeleteConfirm = async () => {
@@ -472,13 +455,14 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
     const id = confirmDeleteId;
     setConfirmDeleteId(null);
     try {
-      const result = await deleteTodo(id);
-      if (result.error) {
-        setError(result.error);
+      const res = await fetch(`/api/todos/${id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const data = await res.json();
+        setError(data.error || "Failed to delete task");
         return;
       }
       if (expandedId === id) setExpandedId(null);
-      await refresh();
+      setTodos((prev) => prev.filter((t) => t.id !== id));
     } catch {
       setError("Failed to delete task.");
     }
@@ -489,20 +473,25 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
     setError(null);
     setDepLoading(true);
     try {
-      const results = await addMultipleDependencies(
-        todoId,
-        Array.from(selectedDeps)
-      );
-      const errors = results.filter((r) => r.error);
-      if (errors.length > 0) {
-        setError(errors.map((e) => e.error).join("; "));
+      const depIds = Array.from(selectedDeps);
+      const errors: string[] = [];
+      for (const depId of depIds) {
+        const res = await fetch(`/api/todos/${todoId}/dependencies`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ dependsOnId: depId }),
+        });
+        if (!res.ok) {
+          const data = await res.json();
+          errors.push(data.error || "Failed to add dependency");
+        }
       }
+      if (errors.length > 0) setError(errors.join("; "));
       setSelectedDeps(new Set());
       setDepSearch("");
-      await refresh();
+      reloadAfterMutation();
     } catch {
       setError("Failed to add dependencies.");
-    } finally {
       setDepLoading(false);
     }
   };
@@ -510,15 +499,20 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
   const handleRemoveDep = async (todoId: number, depId: number) => {
     setDepLoading(true);
     try {
-      const result = await removeDependency(todoId, depId);
-      if (result.error) {
-        setError(result.error);
+      const res = await fetch(`/api/todos/${todoId}/dependencies`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dependsOnId: depId }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        setError(data.error || "Failed to remove dependency");
+        setDepLoading(false);
         return;
       }
-      await refresh();
+      reloadAfterMutation();
     } catch {
       setError("Failed to remove dependency.");
-    } finally {
       setDepLoading(false);
     }
   };
@@ -556,12 +550,8 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
       <main className="max-w-5xl mx-auto px-6 py-6 space-y-6">
         {/* Add task row */}
         <div className="bg-white border rounded-lg shadow-sm p-4">
-          <form
+          <div
             className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center"
-            onSubmit={(e) => {
-              e.preventDefault();
-              handleAdd();
-            }}
           >
             <input
               type="text"
@@ -572,6 +562,9 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
               disabled={loading}
               aria-label="New task title"
               maxLength={500}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && newTitle.trim()) handleAdd();
+              }}
             />
             <input
               type="date"
@@ -581,7 +574,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
               disabled={loading}
               aria-label="Due date"
             />
-            <Button type="submit" disabled={loading || !newTitle.trim()}>
+            <Button type="button" onClick={handleAdd} disabled={loading || !newTitle.trim()}>
               {loading ? (
                 <span className="flex items-center gap-2">
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -593,7 +586,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                 </span>
               )}
             </Button>
-          </form>
+          </div>
         </div>
 
         {/* Error */}
@@ -722,7 +715,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                         >
                           {/* Main row */}
                           <div
-                            className={`grid grid-cols-[32px_48px_1fr_140px_140px_48px] gap-2 px-4 py-3 items-center hover:bg-gray-50/50 cursor-pointer ${isPending ? "opacity-70" : ""}`}
+                            className={`grid grid-cols-[32px_48px_1fr_140px_140px_48px] gap-2 px-4 py-3 items-center hover:bg-gray-50/50 cursor-pointer `}
                             onClick={() => toggleExpanded(todo.id)}
                             onKeyDown={(e) => {
                               if (e.key === "Enter" || e.key === " ") {
@@ -819,7 +812,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                     isOverdue(todo.dueDate) && (
                                       <AlertTriangle className="h-3.5 w-3.5" />
                                     )}
-                                  {formatDate(todo.dueDate)}
+                                  {formatDueDate(todo.dueDate)}
                                 </span>
                               ) : (
                                 <span className="text-sm text-gray-400">
@@ -887,7 +880,9 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                       </DialogContent>
                                     </Dialog>
                                   ) : isImgLoading ? (
-                                    <div className="w-full h-48 bg-gray-200 animate-pulse rounded-lg border" />
+                                    <div className="w-full h-48 bg-gray-100 rounded-lg border flex items-center justify-center">
+                                      <Loader2 className="h-8 w-8 text-gray-400 animate-spin" />
+                                    </div>
                                   ) : (
                                     <div className="w-full h-48 bg-gray-100 rounded-lg flex items-center justify-center border">
                                       <span className="text-sm text-muted-foreground">

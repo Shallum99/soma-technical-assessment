@@ -39,7 +39,25 @@ function parseDueDate(value: unknown): ValidationResult<Date | null> {
     return fail("Due date must be a valid YYYY-MM-DD string");
   }
 
-  const parsed = new Date(`${value}T23:59:59.000Z`);
+  // Validate that the date components form a real calendar date
+  // (e.g. reject 2026-02-31 or 2026-13-01)
+  const [yearStr, monthStr, dayStr] = value.split("-");
+  const year = Number(yearStr);
+  const month = Number(monthStr);
+  const day = Number(dayStr);
+  const check = new Date(year, month - 1, day);
+  if (
+    check.getFullYear() !== year ||
+    check.getMonth() !== month - 1 ||
+    check.getDate() !== day
+  ) {
+    return fail("Due date must be a valid calendar date");
+  }
+
+  // Store at noon UTC so the date component (YYYY-MM-DD) is the same
+  // in every timezone from UTC-12 to UTC+14. The client extracts the
+  // date portion from the ISO string and does local-time overdue checks.
+  const parsed = new Date(`${value}T12:00:00.000Z`);
   if (Number.isNaN(parsed.getTime())) {
     return fail("Due date must be a valid YYYY-MM-DD string");
   }

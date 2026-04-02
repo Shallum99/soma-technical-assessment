@@ -1,7 +1,6 @@
 "use server";
 
 import { prisma } from "@/lib/prisma";
-import { revalidatePath } from "next/cache";
 import { wouldCreateCycle } from "@/lib/graph";
 import { startTodoImageFetch } from "@/lib/todo-images";
 import {
@@ -16,10 +15,12 @@ const todoInclude = {
 };
 
 export async function getTodos() {
-  return prisma.todo.findMany({
+  const todos = await prisma.todo.findMany({
     orderBy: { createdAt: "desc" },
     include: todoInclude,
   });
+  // Serialize dates for the client
+  return JSON.parse(JSON.stringify(todos));
 }
 
 export async function createTodo(title: string, dueDate: string | null) {
@@ -28,17 +29,23 @@ export async function createTodo(title: string, dueDate: string | null) {
     return { error: validated.error };
   }
 
-  const todo = await prisma.todo.create({
-    data: {
-      title: validated.value.title,
-      dueDate: validated.value.dueDate,
-    },
-    include: todoInclude,
-  });
+  try {
+    const todo = await prisma.todo.create({
+      data: {
+        title: validated.value.title,
+        dueDate: validated.value.dueDate,
+      },
+      include: todoInclude,
+    });
 
-  startTodoImageFetch(todo.id, validated.value.title);
-  revalidatePath("/");
-  return { todo };
+    startTodoImageFetch(todo.id, validated.value.title);
+    // Serialize dates for the client — server actions can't transfer Date objects
+    const serialized = JSON.parse(JSON.stringify(todo));
+    return { todo: serialized };
+  } catch (e) {
+    console.error("createTodo error:", e);
+    return { error: "Failed to create task" };
+  }
 }
 
 export async function deleteTodo(id: number) {
@@ -47,7 +54,7 @@ export async function deleteTodo(id: number) {
   }
   try {
     await prisma.todo.delete({ where: { id } });
-    revalidatePath("/");
+
     return {};
   } catch (e: unknown) {
     if (e && typeof e === "object" && "code" in e && e.code === "P2025") {
@@ -69,7 +76,7 @@ export async function toggleTodo(id: number, completed: boolean) {
       where: { id },
       data: { completed },
     });
-    revalidatePath("/");
+
     return {};
   } catch (e: unknown) {
     if (e && typeof e === "object" && "code" in e && e.code === "P2025") {
@@ -91,24 +98,24 @@ export async function addDependency(todoId: number, dependsOnId: number) {
     return { error: "A task cannot depend on itself" };
   }
 
-  const [todo, dep] = await Promise.all([
-    prisma.todo.findUnique({ where: { id: todoId } }),
-    prisma.todo.findUnique({ where: { id: dependencyId } }),
-  ]);
-  if (!todo || !dep) return { error: "Todo not found" };
-
-  // Load all edges at once and check for cycles in memory (no N+1)
-  const allEdges = await prisma.todoDependency.findMany({
-    select: { todoId: true, dependsOnId: true },
-  });
-
-  if (wouldCreateCycle(todoId, dependencyId, allEdges)) {
-    return {
-      error: "Adding this dependency would create a circular reference",
-    };
-  }
-
   try {
+    const [todo, dep] = await Promise.all([
+      prisma.todo.findUnique({ where: { id: todoId } }),
+      prisma.todo.findUnique({ where: { id: dependencyId } }),
+    ]);
+    if (!todo || !dep) return { error: "Todo not found" };
+
+    // Load all edges at once and check for cycles in memory (no N+1)
+    const allEdges = await prisma.todoDependency.findMany({
+      select: { todoId: true, dependsOnId: true },
+    });
+
+    if (wouldCreateCycle(todoId, dependencyId, allEdges)) {
+      return {
+        error: "Adding this dependency would create a circular reference",
+      };
+    }
+
     await prisma.todoDependency.create({
       data: { todoId, dependsOnId: dependencyId },
     });
@@ -119,7 +126,6 @@ export async function addDependency(todoId: number, dependsOnId: number) {
     return { error: "Error creating dependency" };
   }
 
-  revalidatePath("/");
   return {};
 }
 
@@ -138,7 +144,7 @@ export async function removeDependency(todoId: number, dependsOnId: number) {
     if (result.count === 0) {
       return { error: "Dependency not found" };
     }
-    revalidatePath("/");
+
     return {};
   } catch {
     return { error: "Failed to remove dependency" };
@@ -174,9 +180,10 @@ export async function addMultipleDependencies(
     select: { todoId: true, dependsOnId: true },
   });
 
-  const results: { id: number; error?: string }[] = [];
-  // Track edges as we add them so subsequent checks see prior additions
+  // Pre-validate all dependencies before creating any
   const currentEdges = [...allEdges];
+  const toCreate: number[] = [];
+  const results: { id: number; error?: string }[] = [];
 
   for (const depId of dependencyIds) {
     if (todoId === depId) {
@@ -197,21 +204,35 @@ export async function addMultipleDependencies(
       continue;
     }
 
+    // Track the edge so subsequent cycle checks see it
+    currentEdges.push({ todoId, dependsOnId: depId });
+    toCreate.push(depId);
+    results.push({ id: depId });
+  }
+
+  // Create all valid dependencies in a single transaction
+  if (toCreate.length > 0) {
     try {
-      await prisma.todoDependency.create({
-        data: { todoId, dependsOnId: depId },
-      });
-      currentEdges.push({ todoId, dependsOnId: depId });
-      results.push({ id: depId });
+      await prisma.$transaction(
+        toCreate.map((depId) =>
+          prisma.todoDependency.create({
+            data: { todoId, dependsOnId: depId },
+          })
+        )
+      );
     } catch (e: unknown) {
-      if (e && typeof e === "object" && "code" in e && e.code === "P2002") {
-        results.push({ id: depId, error: "Dependency already exists" });
-      } else {
-        results.push({ id: depId, error: "Error creating dependency" });
+      // If the transaction fails, mark all creates as failed
+      for (const result of results) {
+        if (!result.error) {
+          if (e && typeof e === "object" && "code" in e && e.code === "P2002") {
+            result.error = "Dependency already exists";
+          } else {
+            result.error = "Error creating dependency";
+          }
+        }
       }
     }
   }
 
-  revalidatePath("/");
   return results;
 }
