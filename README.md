@@ -116,14 +116,15 @@ npm test
 - Added an optional `dueDate` field to the Todo model via Prisma migration.
 - Inline date picker in the task creation row with `maxLength` validation.
 - Sortable due date column — click the header to toggle ascending/descending.
-- Due dates are stored as end-of-day (23:59:59). Overdue detection compares the stored timestamp against the current time, so a task due "today" is shown in **red** with a warning icon starting the following morning.
+- Due dates are stored at **noon UTC** so the selected calendar day survives timezone conversion. Overdue detection still compares against the **end of the local day**, so a task due "today" turns red the following morning.
 
 ### Part 2: Image Previews (Pexels API)
 
-- Todo creation inserts the task row immediately, then kicks off the Pexels lookup on the server in the background. This keeps creation fast and allows the **todo item itself** to display an animated skeleton placeholder while the image search runs.
-- Once the Pexels response arrives, the image URL is persisted and the UI refreshes to show the inline thumbnail.
+- Todo creation inserts the task row immediately with a persisted `imageStatus`, so the item can show a **real loading state** while image lookup is in progress.
+- The client then calls a dedicated `/api/todos/[id]/image` route to fetch and persist the image. Pending image lookups are resumed automatically on refresh, and failed lookups can be retried from the expanded row.
+- Once the Pexels response arrives, the image URL is persisted and the row updates in place without a full page reload.
 - Clicking the thumbnail in the expanded row opens a **full-size preview dialog** (Radix Dialog).
-- The Pexels fetch has a **5-second timeout** so task creation is never blocked indefinitely by an external API.
+- The Pexels fetch has a **5-second timeout** so external image lookup fails fast and the todo is marked with a clear error or unavailable state instead of hanging indefinitely.
 - The Pexels API key is stored in `.env.local` and only accessed server-side — never exposed to the client.
 
 ### Part 3: Task Dependencies
@@ -134,16 +135,16 @@ npm test
 
 - **Circular dependency prevention** — dual defense:
   - **Client-side**: DFS reachability check (`canReach`) filters invalid options out of the picker entirely, so users never see an option that would create a cycle.
-  - **Server-side**: `wouldCreateCycle` loads all edges in a single query and runs an in-memory BFS check before creating the dependency. Returns a clear error if a cycle would result.
+  - **Server-side**: Dependency creation accepts batched adds, loads the graph once, performs cumulative cycle checks in memory, and returns a clear per-dependency result.
 
-- **Critical path**: All root tasks (no dependencies) share a common project-start baseline, so the critical path is determined purely by dependency-graph depth — not task creation order. Computed via Kahn's topological sort, a forward pass for earliest start/finish, and iterative traceback from the latest-finishing task. Critical path tasks are highlighted with orange badges and row tinting.
+- **Critical path**: All root tasks share a common schedule baseline, so the critical-path calculation is driven by the dependency graph rather than `createdAt`. The graph analysis now performs a forward pass plus backward pass, identifies zero-slack tasks, and highlights **all tied critical paths** instead of collapsing ties to one arbitrary path.
 
-- **Earliest start dates**: Calculated per task based on its dependency chain (each task assumed to take 1 day). Displayed in the expanded row for tasks with dependencies, along with a warning about critical path impact.
+- **Earliest start dates**: Calculated for **every task**, including root tasks, based on its dependency chain. Because the prompt does not provide task durations, the schedule uses a default **1-day duration per task** and anchors the plan to the current day.
 
 - **Interactive dependency graph** (React Flow): The "Dependencies" tab shows a draggable, zoomable graph with:
   - Hierarchical left-to-right layout computed by topological level
-  - Critical path nodes highlighted with orange borders and shadow
-  - Animated dashed edges on the critical path, dimmed gray edges elsewhere
+  - Critical-task nodes highlighted with orange borders and shadow
+  - Animated dashed edges across every critical edge, dimmed gray edges elsewhere
   - Draggable nodes with zoom/pan controls
   - Only connected tasks are shown (tasks without dependencies are hidden for clarity)
 
@@ -153,20 +154,22 @@ npm test
 - **Status filters**: Filter by All / Pending / Completed with live counts. Filter state is persisted in the URL via nuqs (e.g., `?status=pending&tab=dependencies`).
 - **Delete confirmation**: Styled modal dialog instead of browser `confirm()` for consistent UX.
 - **Error boundary**: Wraps the app to catch render errors gracefully instead of white-screening.
-- **Loading states**: Spinner on the Add button during task creation, spinner and disabled controls during dependency add/remove operations, dimmed rows during optimistic transitions.
+- **Loading states**: Spinner on the Add button during task creation, persisted image loading/error states per todo, spinner and disabled controls during dependency add/remove operations, and disabled completion toggles while optimistic updates are in flight.
 - **Accessibility**: `aria-label` on all interactive controls (toggle, sort, delete, filter, search), `role="alert"` on error messages, `aria-pressed` on filter buttons, `aria-expanded` on expandable rows.
 - **Input validation**: Title trimming and 500-character max length enforced server-side.
-- **Form semantics**: Add-task inputs wrapped in a `<form>` element with `onSubmit`.
+- **Form semantics**: Add-task inputs are wrapped in a real `<form>` with `onSubmit`, so Enter works through native browser form behavior.
 
 ### Testing
 
-Vitest unit tests cover the graph algorithm library plus shared todo-validation helpers:
+Vitest tests cover the graph algorithm library, shared todo-validation helpers, and the key API routes for todo creation and image fetching:
 
 - **`topologicalSort`** — empty input, single node, linear chains, diamond dependencies, cycles, multiple independent chains, multi-dependency nodes
 - **`canReach`** — direct edges, transitive paths, unreachable nodes, reverse direction, cycle handling
 - **`wouldCreateCycle`** — no edges, direct back-edges, transitive cycles, parallel chains, diamond cycles
-- **`analyzeGraph`** — empty input, single-node critical path, linear chains, earliest start calculation, default baseline inference, diamond path selection, longer branch selection, cyclic input, independent tasks, fixed baseline verification, proof that later-created independent tasks cannot steal the critical path from a dependency chain
+- **`analyzeGraph`** — empty input, single-node critical path, linear chains, earliest start calculation, default current-day baseline, multiple tied critical paths, longer branch selection, cyclic input, independent tasks, fixed baseline verification, proof that later-created independent tasks cannot steal the critical path from a dependency chain
 - **`todo-validation`** — create/update payload validation, due-date parsing, and ID/dependency validation
+- **`/api/todos`** — GET serialization, create validation, and persisted image status on create
+- **`/api/todos/[id]/image`** — not-found handling, no-op when an image already exists, and the persisted image-fetch flow
 
 ```bash
 npm test          # run once
@@ -179,8 +182,7 @@ npm run test:watch  # watch mode
 app/
   page.tsx              Server component — fetches todos, passes to client
   layout.tsx            Root layout with NuqsAdapter + ErrorBoundary
-  actions/todos.ts      Server actions for all mutations (create, delete, toggle, deps)
-  api/todos/            REST API routes (kept for programmatic/external access)
+  api/todos/            REST API routes for todos, dependencies, and image lookup
 
 components/
   todo-app.tsx          Main client component — state, handlers, UI orchestration
@@ -190,7 +192,8 @@ components/
 
 lib/
   graph.ts              Pure functions: topologicalSort, analyzeGraph, canReach, wouldCreateCycle
-  todo-images.ts        Server-side background Pexels fetch + persistence helper
+  todo-images.ts        Pexels image fetch + persistence helper with stored status/error state
+  todo-service.ts       Shared server-side todo queries and mutation helpers
   todo-validation.ts    Shared validation/parsing helpers for actions and routes
   types.ts              Shared TypeScript interfaces (Todo, SortField, SortDir)
   prisma.ts             Prisma client singleton
@@ -201,15 +204,17 @@ prisma/
   schema.prisma         Todo + TodoDependency models with cascade deletes
 
 __tests__/
-  graph.test.ts         Graph algorithm tests (vitest)
+  graph.test.ts           Graph algorithm tests (vitest)
   todo-validation.test.ts Shared validation helper tests (vitest)
+  todos-route.test.ts     API route tests for todo CRUD (vitest)
+  todo-image-route.test.ts API route tests for image fetch flow (vitest)
 ```
 
 ### Tech Stack
 
 | Layer | Choice | Why |
 |-------|--------|-----|
-| Framework | Next.js 14 (App Router) | Server components + server actions eliminate client-side data waterfalls |
+| Framework | Next.js 14 (App Router) | Server components for initial data load plus route handlers for mutations keep the app simple and predictable |
 | Database | Prisma + SQLite | Type-safe ORM with simple file-based DB, zero config |
 | UI | shadcn/ui (Radix + Tailwind + CVA) | Accessible primitives with consistent styling |
 | Graph viz | React Flow | Interactive pan/zoom/drag with animated edges |

@@ -13,6 +13,8 @@ model Todo {
   completed Boolean  @default(false)
   dueDate   DateTime?
   imageUrl  String?
+  imageStatus String  @default("pending")
+  imageError  String?
   createdAt DateTime @default(now())
 
   // Dependencies: tasks this todo depends on
@@ -30,4 +32,5 @@ model TodoDependency {
   dependsOn    Todo @relation("DependencyTask", fields: [dependsOnId], references: [id], onDelete: Cascade)
 
   @@unique([todoId, dependsOnId])
+  @@index([dependsOnId])
 }

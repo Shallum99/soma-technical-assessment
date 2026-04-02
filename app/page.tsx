@@ -1,11 +1,12 @@
-import { getTodos } from "@/app/actions/todos";
 import { TodoApp } from "@/components/todo-app";
+import { listTodos, serializeForClient } from "@/lib/todo-service";
+import type { Todo } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
 export default async function Home() {
-  const todos = await getTodos();
-  // Serialize dates for client
-  const serialized = JSON.parse(JSON.stringify(todos));
-  return <TodoApp initialTodos={serialized} />;
+  const todos = await listTodos();
+  return (
+    <TodoApp initialTodos={serializeForClient(todos) as unknown as Todo[]} />
+  );
 }

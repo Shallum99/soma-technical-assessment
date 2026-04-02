@@ -1,3 +1,9 @@
+export type TodoImageStatus =
+  | "pending"
+  | "ready"
+  | "failed"
+  | "unavailable";
+
 export interface TodoDependencyRelation {
   id: number;
   dependsOnId: number;
@@ -16,6 +22,8 @@ export interface Todo {
   completed: boolean;
   dueDate: string | null;
   imageUrl: string | null;
+  imageStatus: TodoImageStatus;
+  imageError: string | null;
   createdAt: string;
   dependsOn: TodoDependencyRelation[];
   dependedBy: TodoDependedByRelation[];

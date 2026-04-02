@@ -1,24 +1,21 @@
-// REST API routes — the UI uses server actions (app/actions/todos.ts),
-// but these routes are kept for external/programmatic access (e.g. seed script).
-import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
-import { startTodoImageFetch } from '@/lib/todo-images';
-import { validateCreateTodoInput } from '@/lib/todo-validation';
+import { NextResponse } from "next/server";
+import {
+  createTodoRecord,
+  listTodos,
+  serializeForClient,
+} from "@/lib/todo-service";
+import { validateCreateTodoInput } from "@/lib/todo-validation";
 
-const todoInclude = {
-  dependsOn: { include: { dependsOn: true } },
-  dependedBy: { include: { todo: true } },
-};
+export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
-    const todos = await prisma.todo.findMany({
-      orderBy: { createdAt: 'desc' },
-      include: todoInclude,
+    const todos = await listTodos();
+    return NextResponse.json(serializeForClient(todos), {
+      headers: { "Cache-Control": "no-store" },
     });
-    return NextResponse.json(todos);
   } catch {
-    return NextResponse.json({ error: 'Error fetching todos' }, { status: 500 });
+    return NextResponse.json({ error: "Error fetching todos" }, { status: 500 });
   }
 }
 
@@ -27,7 +24,7 @@ export async function POST(request: Request) {
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
   try {
@@ -38,18 +35,13 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: validated.error }, { status: 400 });
     }
 
-    const todo = await prisma.todo.create({
-      data: {
-        title: validated.value.title,
-        dueDate: validated.value.dueDate,
-      },
-      include: todoInclude,
+    const todo = await createTodoRecord({
+      title: validated.value.title,
+      dueDate: validated.value.dueDate,
     });
 
-    startTodoImageFetch(todo.id, validated.value.title);
-
-    return NextResponse.json(todo, { status: 201 });
+    return NextResponse.json(serializeForClient(todo), { status: 201 });
   } catch {
-    return NextResponse.json({ error: 'Error creating todo' }, { status: 500 });
+    return NextResponse.json({ error: "Error creating todo" }, { status: 500 });
   }
 }

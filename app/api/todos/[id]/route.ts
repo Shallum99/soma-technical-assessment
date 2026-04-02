@@ -1,9 +1,14 @@
-import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { NextResponse } from "next/server";
+import {
+  deleteTodoRecord,
+  getTodoById,
+  serializeForClient,
+  updateTodoRecord,
+} from "@/lib/todo-service";
 import {
   validateNumericId,
   validateUpdateTodoInput,
-} from '@/lib/todo-validation';
+} from "@/lib/todo-validation";
 
 interface Params {
   params: {
@@ -11,30 +16,51 @@ interface Params {
   };
 }
 
-export async function DELETE(request: Request, { params }: Params) {
+export const dynamic = "force-dynamic";
+
+export async function GET(request: Request, { params }: Params) {
   const validatedId = validateNumericId(params.id);
   if (!validatedId.ok) {
-    return NextResponse.json({ error: 'Invalid ID' }, { status: 400 });
+    return NextResponse.json({ error: "Invalid ID" }, { status: 400 });
   }
   const id = validatedId.value;
 
   try {
-    await prisma.todo.delete({
-      where: { id },
-    });
-    return NextResponse.json({ message: 'Todo deleted' }, { status: 200 });
-  } catch (e: unknown) {
-    if (e && typeof e === 'object' && 'code' in e && e.code === 'P2025') {
-      return NextResponse.json({ error: 'Todo not found' }, { status: 404 });
+    const todo = await getTodoById(id);
+    if (!todo) {
+      return NextResponse.json({ error: "Todo not found" }, { status: 404 });
     }
-    return NextResponse.json({ error: 'Error deleting todo' }, { status: 500 });
+
+    return NextResponse.json(serializeForClient(todo), {
+      headers: { "Cache-Control": "no-store" },
+    });
+  } catch {
+    return NextResponse.json({ error: "Error fetching todo" }, { status: 500 });
+  }
+}
+
+export async function DELETE(request: Request, { params }: Params) {
+  const validatedId = validateNumericId(params.id);
+  if (!validatedId.ok) {
+    return NextResponse.json({ error: "Invalid ID" }, { status: 400 });
+  }
+  const id = validatedId.value;
+
+  try {
+    await deleteTodoRecord(id);
+    return NextResponse.json({ message: "Todo deleted" }, { status: 200 });
+  } catch (e: unknown) {
+    if (e && typeof e === "object" && "code" in e && e.code === "P2025") {
+      return NextResponse.json({ error: "Todo not found" }, { status: 404 });
+    }
+    return NextResponse.json({ error: "Error deleting todo" }, { status: 500 });
   }
 }
 
 export async function PATCH(request: Request, { params }: Params) {
   const validatedId = validateNumericId(params.id);
   if (!validatedId.ok) {
-    return NextResponse.json({ error: 'Invalid ID' }, { status: 400 });
+    return NextResponse.json({ error: "Invalid ID" }, { status: 400 });
   }
   const id = validatedId.value;
 
@@ -42,7 +68,7 @@ export async function PATCH(request: Request, { params }: Params) {
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
   try {
@@ -51,19 +77,12 @@ export async function PATCH(request: Request, { params }: Params) {
       return NextResponse.json({ error: validated.error }, { status: 400 });
     }
 
-    const todo = await prisma.todo.update({
-      where: { id },
-      data: validated.value,
-      include: {
-        dependsOn: { include: { dependsOn: true } },
-        dependedBy: { include: { todo: true } },
-      },
-    });
-    return NextResponse.json(todo);
+    const todo = await updateTodoRecord(id, validated.value);
+    return NextResponse.json(serializeForClient(todo));
   } catch (e: unknown) {
-    if (e && typeof e === 'object' && 'code' in e && e.code === 'P2025') {
-      return NextResponse.json({ error: 'Todo not found' }, { status: 404 });
+    if (e && typeof e === "object" && "code" in e && e.code === "P2025") {
+      return NextResponse.json({ error: "Todo not found" }, { status: 404 });
     }
-    return NextResponse.json({ error: 'Error updating todo' }, { status: 500 });
+    return NextResponse.json({ error: "Error updating todo" }, { status: 500 });
   }
 }

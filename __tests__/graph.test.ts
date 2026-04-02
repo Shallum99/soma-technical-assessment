@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   topologicalSort,
   analyzeGraph,
@@ -26,6 +26,10 @@ function node(id: number, deps: number[] = []): TodoNode {
 const START = new Date("2024-01-01T00:00:00.000Z");
 const DAY = 24 * 60 * 60 * 1000;
 const startTime = START.getTime();
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 // ─── topologicalSort ────────────────────────────────────────────────────────
 
@@ -203,7 +207,10 @@ describe("analyzeGraph", () => {
     expect(result.earliestStart.get(3)!.getTime()).toBe(startTime + 2 * DAY);
   });
 
-  it("uses the earliest createdAt as the default project baseline", () => {
+  it("uses the current local day as the default project baseline", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-01T15:45:00.000Z"));
+
     const todos = [
       {
         ...node(1),
@@ -215,10 +222,13 @@ describe("analyzeGraph", () => {
       },
     ];
     const result = analyzeGraph(todos);
-    const inferredStart = new Date("2024-02-01T00:00:00.000Z").getTime();
+    const expectedStart = new Date();
+    expectedStart.setHours(0, 0, 0, 0);
 
-    expect(result.earliestStart.get(1)!.getTime()).toBe(inferredStart);
-    expect(result.earliestStart.get(2)!.getTime()).toBe(inferredStart + DAY);
+    expect(result.earliestStart.get(1)!.getTime()).toBe(expectedStart.getTime());
+    expect(result.earliestStart.get(2)!.getTime()).toBe(
+      expectedStart.getTime() + DAY
+    );
   });
 
   it("all root tasks share the same baseline regardless of createdAt", () => {
@@ -251,6 +261,23 @@ describe("analyzeGraph", () => {
     expect(result.criticalPath).toHaveLength(3);
     expect(result.criticalPath[0]).toBe(1);
     expect(result.criticalPath[2]).toBe(4);
+  });
+
+  it("returns all tied critical paths in a diamond", () => {
+    const todos = [node(1), node(2, [1]), node(3, [1]), node(4, [2, 3])];
+    const result = analyzeGraph(todos, START);
+
+    expect(result.criticalTaskIds).toEqual([1, 2, 3, 4]);
+    expect(result.criticalPaths).toEqual([
+      [1, 2, 4],
+      [1, 3, 4],
+    ]);
+    expect(result.criticalEdgeIds.sort()).toEqual([
+      "1-2",
+      "1-3",
+      "2-4",
+      "3-4",
+    ]);
   });
 
   it("selects the longer branch as critical path", () => {

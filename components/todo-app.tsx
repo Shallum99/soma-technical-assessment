@@ -98,14 +98,20 @@ const dueDateSortValue = (d: string) => {
   return Date.UTC(parsed.year, parsed.month - 1, parsed.day);
 };
 
-const formatDateTime = (d: Date) =>
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+const formatScheduleDate = (d: Date) =>
   d.toLocaleDateString("en-US", {
     month: "short",
     day: "numeric",
     year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
   });
+
+const formatSlack = (slackMs: number) => {
+  const slackDays = Math.round(slackMs / DAY_MS);
+  if (slackDays <= 0) return "No slack";
+  return `${slackDays} day${slackDays === 1 ? "" : "s"} of slack`;
+};
 
 // ─── Image with skeleton loading state ───────────────────────────────────────
 function ImageWithSkeleton({
@@ -167,30 +173,45 @@ function SortIndicator({
 
 // ─── Critical Path Summary ──────────────────────────────────────────────────
 function CriticalPathSummary({
-  criticalPath,
+  criticalPaths,
   todos,
 }: {
-  criticalPath: number[];
+  criticalPaths: number[][];
   todos: Todo[];
 }) {
-  if (criticalPath.length <= 1) return null;
+  const visiblePaths = criticalPaths.filter((path) => path.length > 1);
+  const todoMap = useMemo(() => new Map(todos.map((todo) => [todo.id, todo])), [todos]);
+
+  if (visiblePaths.length === 0) return null;
+
   return (
     <div className="bg-orange-50 border border-orange-200 rounded-lg p-4">
       <h3 className="text-sm font-semibold text-orange-800 mb-2">
-        Critical Path
+        {visiblePaths.length === 1
+          ? "Critical Path"
+          : `Critical Paths (${visiblePaths.length})`}
       </h3>
-      <div className="flex flex-wrap items-center gap-1">
-        {criticalPath.map((id, i) => {
-          const t = todos.find((t) => t.id === id);
-          return (
-            <span key={id} className="flex items-center gap-1">
-              <Badge variant="warning">{t?.title || `#${id}`}</Badge>
-              {i < criticalPath.length - 1 && (
-                <ArrowRight className="h-3 w-3 text-orange-400" />
-              )}
-            </span>
-          );
-        })}
+      <div className="space-y-2">
+        {visiblePaths.map((path, pathIndex) => (
+          <div key={path.join("-")} className="flex flex-wrap items-center gap-1">
+            {visiblePaths.length > 1 && (
+              <span className="mr-1 text-xs font-medium text-orange-700">
+                Path {pathIndex + 1}
+              </span>
+            )}
+            {path.map((id, i) => {
+              const todo = todoMap.get(id);
+              return (
+                <span key={`${pathIndex}-${id}`} className="flex items-center gap-1">
+                  <Badge variant="warning">{todo?.title || `#${id}`}</Badge>
+                  {i < path.length - 1 && (
+                    <ArrowRight className="h-3 w-3 text-orange-400" />
+                  )}
+                </span>
+              );
+            })}
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -220,6 +241,13 @@ function TodoThumbnail({
       </div>
     );
   }
+  if (todo.imageStatus === "failed") {
+    return (
+      <div className="w-10 h-10 bg-red-50 rounded flex items-center justify-center border border-red-100">
+        <AlertTriangle className="h-4 w-4 text-red-400" />
+      </div>
+    );
+  }
   return (
     <div className="w-10 h-10 bg-gray-100 rounded flex items-center justify-center">
       <ImageIcon className="h-4 w-4 text-gray-400" />
@@ -242,7 +270,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
   const [depLoading, setDepLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
-  const [imageLoadingIds, setImageLoadingIds] = useState<Set<number>>(
+  const [mutatingTodoIds, setMutatingTodoIds] = useState<Set<number>>(
     new Set()
   );
   const mountedRef = useRef(true);
@@ -259,29 +287,50 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
     defaultValue: "all",
   });
 
-  // Refresh data from server via REST API (avoids server action serialization issues)
-  const refresh = useCallback(async () => {
-    try {
-      const res = await fetch("/api/todos");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as Todo[];
-      if (mountedRef.current) {
-        setTodos(data);
-      }
-      return data;
-    } catch (e) {
-      console.error("Failed to refresh todos:", e);
-      return null;
-    }
-  }, []);
+  // Reload all todos from the server and update state.
+  // Defined as a plain async function (not useCallback) so it always
+  // captures the current setTodos — avoids stale-closure issues with HMR.
+  async function reloadTodos() {
+    const res = await fetch("/api/todos", { cache: "no-store" });
+    if (!res.ok) return;
+    const data = (await res.json()) as Todo[];
+    setTodos(data);
+  }
 
-  const stopImageLoading = useCallback((todoId: number) => {
-    setImageLoadingIds((prev) => {
-      if (!prev.has(todoId)) return prev;
+  const setTodoMutating = useCallback((todoId: number, isMutating: boolean) => {
+    setMutatingTodoIds((prev) => {
       const next = new Set(prev);
-      next.delete(todoId);
+      if (isMutating) next.add(todoId);
+      else next.delete(todoId);
       return next;
     });
+  }, []);
+
+  // On mount, resume any images left in "pending" state from a previous session
+  useEffect(() => {
+    let cancelled = false;
+    async function resumePending() {
+      const pending = initialTodos.filter(
+        (t) => t.imageStatus === "pending" && !t.imageUrl
+      );
+      if (pending.length === 0) return;
+
+      for (const todo of pending) {
+        if (cancelled) return;
+        await fetch(`/api/todos/${todo.id}/image`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        }).catch(() => {});
+      }
+
+      if (!cancelled) {
+        await reloadTodos();
+      }
+    }
+    void resumePending();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Close dep dropdown on click outside
@@ -308,19 +357,22 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
 
   // ── Graph analysis ─────────────────────────────────────────────────────────
   const projectStart = useMemo(() => {
-    if (todos.length === 0) return new Date();
+    const baseline = new Date();
+    baseline.setHours(0, 0, 0, 0);
+    return baseline;
+  }, []);
 
-    return todos.reduce((earliest, todo) => {
-      const createdAt = new Date(todo.createdAt);
-      return createdAt < earliest ? createdAt : earliest;
-    }, new Date(todos[0].createdAt));
-  }, [todos]);
-
-  const { earliestStart, criticalPath } = useMemo(
+  const {
+    earliestStart,
+    slackMs,
+    criticalPaths,
+    criticalTaskIds,
+    criticalEdgeIds,
+  } = useMemo(
     () => analyzeGraph(todos, projectStart),
     [todos, projectStart]
   );
-  const criticalSet = useMemo(() => new Set(criticalPath), [criticalPath]);
+  const criticalSet = useMemo(() => new Set(criticalTaskIds), [criticalTaskIds]);
 
   const adjacency = useMemo(() => {
     const map = new Map<number, number[]>();
@@ -407,47 +459,98 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/todos", {
+      const createRes = await fetch("/api/todos", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title, dueDate: newDueDate || null }),
       });
-      const todo = await res.json();
-      if (!res.ok) {
-        setError(todo.error || "Failed to add todo.");
-        setLoading(false);
+      const createdTodo = (await createRes.json()) as Todo;
+      if (!createRes.ok) {
+        setError((createdTodo as unknown as { error?: string }).error || "Failed to add todo.");
         return;
       }
+
       setNewTitle("");
       setNewDueDate("");
-      setTodos((prev) => [todo, ...prev]);
-      setImageLoadingIds((prev) => new Set(prev).add(todo.id));
+      setTodos((prev) => [createdTodo, ...prev]);
       setLoading(false);
 
-      // Reload after Pexels image has had time to save (~3s)
-      window.setTimeout(() => window.location.reload(), 3000);
+      // Fetch the Pexels image, then reload all todos so it appears in-place
+      if (createdTodo.imageStatus === "pending") {
+        const imgRes = await fetch(`/api/todos/${createdTodo.id}/image`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        if (imgRes.ok) {
+          await reloadTodos();
+        } else {
+          const err = await imgRes.json().catch(() => null);
+          const message =
+            (err && typeof err === "object" && "error" in err && err.error) ||
+            "Failed to fetch image.";
+          setTodos((prev) =>
+            prev.map((t) =>
+              t.id === createdTodo.id
+                ? { ...t, imageStatus: "failed" as const, imageError: message }
+                : t
+            )
+          );
+        }
+      }
     } catch {
       setError("Failed to add todo.");
+    } finally {
       setLoading(false);
     }
   };
 
-  const reloadAfterMutation = () => window.location.reload();
+  const handleToggle = async (id: number, completed: boolean) => {
+    const previousTodo = todos.find((todo) => todo.id === id);
+    if (!previousTodo || mutatingTodoIds.has(id)) return;
 
-  const handleToggle = (id: number, completed: boolean) => {
-    // Optimistic update
+    setTodoMutating(id, true);
     setTodos((prev) =>
-      prev.map((t) => (t.id === id ? { ...t, completed } : t))
+      prev.map((todo) => (todo.id === id ? { ...todo, completed } : todo))
     );
-    fetch(`/api/todos/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ completed }),
-    })
-      .then((res) => {
-        if (!res.ok) reloadAfterMutation();
-      })
-      .catch(() => reloadAfterMutation());
+
+    try {
+      const res = await fetch(`/api/todos/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ completed }),
+      });
+      const data = (await res.json().catch(() => null)) as
+        | Todo
+        | { error?: string }
+        | null;
+
+      if (!res.ok) {
+        setTodos((prev) =>
+          prev.map((todo) => (todo.id === id ? previousTodo : todo))
+        );
+        setError(
+          (data && "error" in data && data.error) || "Failed to update task."
+        );
+        return;
+      }
+
+      if (data && "id" in data) {
+        const updatedTodo = data as Todo;
+        setTodos((prev) => {
+          const idx = prev.findIndex((t) => t.id === updatedTodo.id);
+          if (idx === -1) return prev;
+          const next = [...prev];
+          next[idx] = updatedTodo;
+          return next;
+        });
+      }
+    } catch {
+      setTodos((prev) => prev.map((todo) => (todo.id === id ? previousTodo : todo)));
+      setError("Failed to update task.");
+    } finally {
+      setTodoMutating(id, false);
+    }
   };
 
   const handleDeleteConfirm = async () => {
@@ -473,25 +576,37 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
     setError(null);
     setDepLoading(true);
     try {
-      const depIds = Array.from(selectedDeps);
-      const errors: string[] = [];
-      for (const depId of depIds) {
-        const res = await fetch(`/api/todos/${todoId}/dependencies`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ dependsOnId: depId }),
-        });
-        if (!res.ok) {
-          const data = await res.json();
-          errors.push(data.error || "Failed to add dependency");
-        }
+      const res = await fetch(`/api/todos/${todoId}/dependencies`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ dependsOnIds: Array.from(selectedDeps) }),
+      });
+      const data = (await res.json()) as
+        | { results?: { id: number; error?: string }[]; error?: string }
+        | undefined;
+
+      if (!res.ok) {
+        setError(data?.error || "Failed to add dependencies.");
+        return;
       }
-      if (errors.length > 0) setError(errors.join("; "));
+
+      const errors =
+        data?.results
+          ?.filter((result) => result.error)
+          .map((result) => result.error as string) || [];
+
       setSelectedDeps(new Set());
       setDepSearch("");
-      reloadAfterMutation();
+      setDepDropdownOpen(false);
+
+      await reloadTodos();
+
+      if (errors.length > 0) {
+        setError(errors.join("; "));
+      }
     } catch {
       setError("Failed to add dependencies.");
+    } finally {
       setDepLoading(false);
     }
   };
@@ -507,12 +622,13 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
       if (!res.ok) {
         const data = await res.json();
         setError(data.error || "Failed to remove dependency");
-        setDepLoading(false);
         return;
       }
-      reloadAfterMutation();
+
+      await reloadTodos();
     } catch {
       setError("Failed to remove dependency.");
+    } finally {
       setDepLoading(false);
     }
   };
@@ -538,9 +654,10 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
           <h1 className="text-2xl font-bold text-gray-900">Things To Do</h1>
           <p className="text-sm text-muted-foreground">
             {pendingCount} pending · {completedCount} completed
-            {criticalPath.length > 1 && (
+            {criticalTaskIds.length > 0 && (
               <span className="ml-2 text-orange-600">
-                · {criticalPath.length} on critical path
+                · {criticalTaskIds.length} critical task
+                {criticalTaskIds.length === 1 ? "" : "s"}
               </span>
             )}
           </p>
@@ -550,8 +667,14 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
       <main className="max-w-5xl mx-auto px-6 py-6 space-y-6">
         {/* Add task row */}
         <div className="bg-white border rounded-lg shadow-sm p-4">
-          <div
+          <form
             className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!loading && newTitle.trim()) {
+                void handleAdd();
+              }
+            }}
           >
             <input
               type="text"
@@ -562,9 +685,6 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
               disabled={loading}
               aria-label="New task title"
               maxLength={500}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && newTitle.trim()) handleAdd();
-              }}
             />
             <input
               type="date"
@@ -574,7 +694,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
               disabled={loading}
               aria-label="Due date"
             />
-            <Button type="button" onClick={handleAdd} disabled={loading || !newTitle.trim()}>
+            <Button type="submit" disabled={loading || !newTitle.trim()}>
               {loading ? (
                 <span className="flex items-center gap-2">
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -586,7 +706,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                 </span>
               )}
             </Button>
-          </div>
+          </form>
         </div>
 
         {/* Error */}
@@ -704,7 +824,9 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                       const expanded = expandedId === todo.id;
                       const onCritical = criticalSet.has(todo.id);
                       const es = earliestStart.get(todo.id);
-                      const isImgLoading = imageLoadingIds.has(todo.id);
+                      const slack = slackMs.get(todo.id) ?? 0;
+                      const isImgLoading = todo.imageStatus === "pending";
+                      const isMutating = mutatingTodoIds.has(todo.id);
 
                       return (
                         <div
@@ -732,13 +854,14 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                             <button
                               onClick={(e) => {
                                 e.stopPropagation();
-                                handleToggle(todo.id, !todo.completed);
+                                void handleToggle(todo.id, !todo.completed);
                               }}
                               className={`flex items-center justify-center ${
                                 todo.completed
                                   ? "text-green-500"
                                   : "text-gray-300 hover:text-gray-500"
                               }`}
+                              disabled={isMutating}
                               aria-label={
                                 todo.completed
                                   ? `Mark "${todo.title}" as incomplete`
@@ -880,21 +1003,58 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                       </DialogContent>
                                     </Dialog>
                                   ) : isImgLoading ? (
-                                    <div className="w-full h-48 bg-gray-100 rounded-lg border flex items-center justify-center">
+                                    <div className="w-full h-48 bg-gray-100 rounded-lg border flex flex-col items-center justify-center gap-2">
                                       <Loader2 className="h-8 w-8 text-gray-400 animate-spin" />
+                                      <p className="text-sm text-muted-foreground">
+                                        Searching Pexels...
+                                      </p>
                                     </div>
                                   ) : (
-                                    <div className="w-full h-48 bg-gray-100 rounded-lg flex items-center justify-center border">
+                                    <div className="w-full h-48 bg-gray-100 rounded-lg border flex flex-col items-center justify-center gap-2 p-4 text-center">
                                       <span className="text-sm text-muted-foreground">
-                                        No image available
+                                        {todo.imageStatus === "failed"
+                                          ? "Image lookup failed"
+                                          : "No image available"}
                                       </span>
+                                      {todo.imageError && (
+                                        <span className="text-xs text-muted-foreground">
+                                          {todo.imageError}
+                                        </span>
+                                      )}
+                                      <Button
+                                        type="button"
+                                        size="sm"
+                                        variant="outline"
+                                        onClick={async () => {
+                                          setTodos((prev) =>
+                                            prev.map((t) =>
+                                              t.id === todo.id
+                                                ? { ...t, imageStatus: "pending" as const, imageError: null }
+                                                : t
+                                            )
+                                          );
+                                          const res = await fetch(
+                                            `/api/todos/${todo.id}/image`,
+                                            {
+                                              method: "POST",
+                                              headers: { "Content-Type": "application/json" },
+                                              body: JSON.stringify({ force: true }),
+                                            }
+                                          );
+                                          if (res.ok) {
+                                            await reloadTodos();
+                                          }
+                                        }}
+                                      >
+                                        Retry image search
+                                      </Button>
                                     </div>
                                   )}
                                 </div>
 
                                 {/* Dependencies + schedule */}
                                 <div className="space-y-4">
-                                  {es && todo.dependsOn.length > 0 && (
+                                  {es && (
                                     <div>
                                       <h4 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-1 flex items-center gap-1">
                                         <Calendar className="h-3 w-3" />{" "}
@@ -903,7 +1063,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                       <p className="text-sm text-gray-700">
                                         Earliest start:{" "}
                                         <span className="font-medium">
-                                          {formatDateTime(es)}
+                                          {formatScheduleDate(es)}
                                         </span>
                                       </p>
                                       {onCritical && (
@@ -911,6 +1071,11 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                           <AlertTriangle className="h-3.5 w-3.5" />
                                           On the critical path — delays here
                                           will delay the whole project
+                                        </p>
+                                      )}
+                                      {!onCritical && (
+                                        <p className="text-sm text-gray-500 mt-1">
+                                          {formatSlack(slack)}
                                         </p>
                                       )}
                                     </div>
@@ -963,7 +1128,11 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                         <input
                                           type="text"
                                           className="w-full h-8 px-2 text-sm rounded-md border border-input bg-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                                          placeholder="Search tasks to add as dependency..."
+                                          placeholder={
+                                            selectedDeps.size > 0
+                                              ? `${selectedDeps.size} selected — type to filter more...`
+                                              : "Search tasks to add as dependency..."
+                                          }
                                           value={depSearch}
                                           onChange={(e) =>
                                             setDepSearch(e.target.value)
@@ -975,6 +1144,32 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                           disabled={depLoading}
                                           aria-label="Search dependencies"
                                         />
+                                        {selectedDeps.size > 0 && (
+                                          <div className="flex flex-wrap gap-1 mt-1.5">
+                                            {Array.from(selectedDeps).map((depId) => {
+                                              const t = todos.find((t) => t.id === depId);
+                                              return (
+                                                <Badge
+                                                  key={depId}
+                                                  variant="secondary"
+                                                  className="gap-1 pr-1 text-xs"
+                                                >
+                                                  {t?.title || `#${depId}`}
+                                                  <button
+                                                    onClick={(e) => {
+                                                      e.stopPropagation();
+                                                      toggleDepSelection(depId);
+                                                    }}
+                                                    className="ml-0.5 rounded-full hover:bg-gray-300 p-0.5"
+                                                    aria-label={`Deselect "${t?.title}"`}
+                                                  >
+                                                    <X className="h-2.5 w-2.5" />
+                                                  </button>
+                                                </Badge>
+                                              );
+                                            })}
+                                          </div>
+                                        )}
                                         {depDropdownOpen &&
                                           filteredDeps.length > 0 && (
                                             <div className="absolute z-10 mt-1 w-full border rounded-md bg-white shadow-lg max-h-48 overflow-y-auto">
@@ -1005,30 +1200,6 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                                   </button>
                                                 );
                                               })}
-                                              {selectedDeps.size > 0 && (
-                                                <div className="sticky bottom-0 border-t bg-white p-2">
-                                                  <Button
-                                                    size="sm"
-                                                    className="w-full"
-                                                    disabled={depLoading}
-                                                    onClick={(e) => {
-                                                      e.stopPropagation();
-                                                      handleAddDeps(todo.id);
-                                                    }}
-                                                  >
-                                                    {depLoading ? (
-                                                      <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-                                                    ) : (
-                                                      <Plus className="h-3 w-3 mr-1" />
-                                                    )}
-                                                    Add {selectedDeps.size}{" "}
-                                                    dependenc
-                                                    {selectedDeps.size > 1
-                                                      ? "ies"
-                                                      : "y"}
-                                                  </Button>
-                                                </div>
-                                              )}
                                             </div>
                                           )}
                                         {depDropdownOpen &&
@@ -1040,6 +1211,28 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                               </p>
                                             </div>
                                           )}
+                                        {selectedDeps.size > 0 && (
+                                          <div className="mt-2">
+                                            <Button
+                                              type="button"
+                                              size="sm"
+                                              className="w-full"
+                                              disabled={depLoading}
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                void handleAddDeps(todo.id);
+                                              }}
+                                            >
+                                              {depLoading ? (
+                                                <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                                              ) : (
+                                                <Plus className="h-3 w-3 mr-1" />
+                                              )}
+                                              Add {selectedDeps.size} dependenc
+                                              {selectedDeps.size > 1 ? "ies" : "y"}
+                                            </Button>
+                                          </div>
+                                        )}
                                       </div>
                                     )}
                                   </div>
@@ -1056,15 +1249,19 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
             )}
 
             <div className="mt-4">
-              <CriticalPathSummary criticalPath={criticalPath} todos={todos} />
+              <CriticalPathSummary criticalPaths={criticalPaths} todos={todos} />
             </div>
           </TabsContent>
 
           {/* Dependencies tab */}
           <TabsContent value="dependencies">
-            <DependencyGraph todos={todos} criticalPath={criticalPath} />
+            <DependencyGraph
+              todos={todos}
+              criticalTaskIds={criticalTaskIds}
+              criticalEdgeIds={criticalEdgeIds}
+            />
             <div className="mt-4">
-              <CriticalPathSummary criticalPath={criticalPath} todos={todos} />
+              <CriticalPathSummary criticalPaths={criticalPaths} todos={todos} />
             </div>
           </TabsContent>
         </Tabs>

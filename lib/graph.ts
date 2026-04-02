@@ -8,21 +8,38 @@ export interface TodoNode {
   dependsOn: { dependsOnId: number }[];
 }
 
-// Each task is assumed to take 1 day for scheduling purposes
+// The prompt does not include task durations, so the schedule defaults to
+// a one-day duration per task.
 const TASK_DURATION_MS = 24 * 60 * 60 * 1000;
+
+function startOfDay(value: Date) {
+  const date = new Date(value);
+  date.setHours(0, 0, 0, 0);
+  return date;
+}
+
+function getTaskDurationMs(_todo: TodoNode) {
+  return TASK_DURATION_MS;
+}
 
 /** Kahn's algorithm — returns topological order or null if cycle exists */
 export function topologicalSort(todos: TodoNode[]): number[] | null {
+  const todoIds = new Set(todos.map((todo) => todo.id));
   const inDegree = new Map<number, number>();
   const adjList = new Map<number, number[]>();
 
   for (const todo of todos) {
-    inDegree.set(todo.id, todo.dependsOn.length);
+    inDegree.set(todo.id, 0);
     if (!adjList.has(todo.id)) adjList.set(todo.id, []);
+  }
+
+  for (const todo of todos) {
     for (const dep of todo.dependsOn) {
+      if (!todoIds.has(dep.dependsOnId)) continue;
       const list = adjList.get(dep.dependsOnId) || [];
       list.push(todo.id);
       adjList.set(dep.dependsOnId, list);
+      inDegree.set(todo.id, (inDegree.get(todo.id) || 0) + 1);
     }
   }
 
@@ -50,36 +67,40 @@ export function topologicalSort(todos: TodoNode[]): number[] | null {
 export interface GraphAnalysis {
   earliestStart: Map<number, Date>;
   earliestFinish: Map<number, Date>;
+  latestStart: Map<number, Date>;
+  latestFinish: Map<number, Date>;
+  slackMs: Map<number, number>;
+  criticalEdgeIds: string[];
   criticalPath: number[];
-}
-
-function inferProjectStart(todos: TodoNode[]): Date {
-  let earliest = new Date(todos[0].createdAt);
-
-  for (const todo of todos) {
-    const createdAt = new Date(todo.createdAt);
-    if (!Number.isNaN(createdAt.getTime()) && createdAt < earliest) {
-      earliest = createdAt;
-    }
-  }
-
-  return earliest;
+  criticalPaths: number[][];
+  criticalTaskIds: number[];
+  projectFinish: Date | null;
+  projectStart: Date;
 }
 
 /**
  * Forward-pass schedule + critical path computation.
  *
- * All root tasks (no dependencies) start at `projectStart` so the critical
- * path is determined purely by graph structure, not task creation order.
+ * All root tasks (no dependencies) start at `projectStart`, which defaults to
+ * the current local day if no baseline is provided.
  */
 export function analyzeGraph(
   todos: TodoNode[],
   projectStart?: Date
 ): GraphAnalysis {
+  const baseline = projectStart ? new Date(projectStart) : startOfDay(new Date());
   const empty: GraphAnalysis = {
     earliestStart: new Map(),
     earliestFinish: new Map(),
+    latestStart: new Map(),
+    latestFinish: new Map(),
+    slackMs: new Map(),
+    criticalEdgeIds: [],
     criticalPath: [],
+    criticalPaths: [],
+    criticalTaskIds: [],
+    projectFinish: null,
+    projectStart: baseline,
   };
   if (!todos || todos.length === 0) return empty;
 
@@ -88,11 +109,19 @@ export function analyzeGraph(
 
   const sorted = topologicalSort(todos);
   if (!sorted) return empty;
-  const baseline = projectStart ?? inferProjectStart(todos);
+
+  const successors = new Map<number, number[]>();
+  for (const todo of todos) {
+    if (!successors.has(todo.id)) successors.set(todo.id, []);
+    for (const dep of todo.dependsOn) {
+      if (!todoMap.has(dep.dependsOnId)) continue;
+      const next = successors.get(dep.dependsOnId) || [];
+      next.push(todo.id);
+      successors.set(dep.dependsOnId, next);
+    }
+  }
 
   // Forward pass: compute earliest start/finish for each task.
-  // Root tasks all share the same baseline so the critical path
-  // reflects dependency depth, not insertion order.
   const earliestStart = new Map<number, Date>();
   const earliestFinish = new Map<number, Date>();
 
@@ -101,47 +130,135 @@ export function analyzeGraph(
     let es = baseline;
 
     for (const dep of todo.dependsOn) {
+      if (!todoMap.has(dep.dependsOnId)) continue;
       const depFinish = earliestFinish.get(dep.dependsOnId);
       if (depFinish && depFinish > es) es = depFinish;
     }
 
     earliestStart.set(id, es);
-    earliestFinish.set(id, new Date(es.getTime() + TASK_DURATION_MS));
+    earliestFinish.set(id, new Date(es.getTime() + getTaskDurationMs(todo)));
   }
 
-  // Find the task with the latest finish — end of critical path
-  let latestFinishId = sorted[0];
-  let latestFinishTime = earliestFinish.get(sorted[0]) || new Date();
+  let projectFinish = earliestFinish.get(sorted[0]) || baseline;
   for (const id of sorted) {
     const ef = earliestFinish.get(id) || new Date();
-    if (ef >= latestFinishTime) {
-      latestFinishTime = ef;
-      latestFinishId = id;
-    }
+    if (ef > projectFinish) projectFinish = ef;
   }
 
-  // Trace back iteratively from the latest-finishing task along critical predecessors
-  const criticalPath: number[] = [];
-  let traceId: number | null = latestFinishId;
-  while (traceId !== null) {
-    criticalPath.push(traceId);
-    const traceNode: TodoNode = todoMap.get(traceId)!;
-    if (traceNode.dependsOn.length === 0) break;
+  const latestStart = new Map<number, Date>();
+  const latestFinish = new Map<number, Date>();
 
-    let criticalPred: number | null = null;
-    let criticalFinish = new Date(0);
-    for (const dep of traceNode.dependsOn) {
-      const ef = earliestFinish.get(dep.dependsOnId) || new Date(0);
-      if (ef >= criticalFinish) {
-        criticalFinish = ef;
-        criticalPred = dep.dependsOnId;
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const id = sorted[i];
+    const todo = todoMap.get(id)!;
+    const downstream = successors.get(id) || [];
+
+    let lf = projectFinish;
+    if (downstream.length > 0) {
+      lf = new Date(
+        Math.min(
+          ...downstream.map(
+            (nextId) => latestStart.get(nextId)?.getTime() ?? projectFinish.getTime()
+          )
+        )
+      );
+    }
+
+    latestFinish.set(id, lf);
+    latestStart.set(id, new Date(lf.getTime() - getTaskDurationMs(todo)));
+  }
+
+  const slackMs = new Map<number, number>();
+  const criticalTaskIds = sorted.filter((id) => {
+    const slack =
+      (latestStart.get(id)?.getTime() ?? 0) -
+      (earliestStart.get(id)?.getTime() ?? 0);
+    slackMs.set(id, slack);
+    return slack === 0;
+  });
+
+  const criticalTaskSet = new Set(criticalTaskIds);
+  const criticalEdgeIds: string[] = [];
+  const criticalSuccessors = new Map<number, number[]>();
+  const criticalIncoming = new Map<number, number[]>();
+
+  for (const todo of todos) {
+    for (const dep of todo.dependsOn) {
+      if (!criticalTaskSet.has(dep.dependsOnId) || !criticalTaskSet.has(todo.id)) {
+        continue;
       }
-    }
-    traceId = criticalPred;
-  }
-  criticalPath.reverse();
+      const depFinish = earliestFinish.get(dep.dependsOnId);
+      const todoStart = earliestStart.get(todo.id);
+      if (!depFinish || !todoStart) continue;
+      if (depFinish.getTime() !== todoStart.getTime()) continue;
 
-  return { earliestStart, earliestFinish, criticalPath };
+      const edgeId = `${dep.dependsOnId}-${todo.id}`;
+      criticalEdgeIds.push(edgeId);
+
+      const next = criticalSuccessors.get(dep.dependsOnId) || [];
+      next.push(todo.id);
+      criticalSuccessors.set(dep.dependsOnId, next);
+
+      const incoming = criticalIncoming.get(todo.id) || [];
+      incoming.push(dep.dependsOnId);
+      criticalIncoming.set(todo.id, incoming);
+    }
+  }
+
+  const topoIndex = new Map(sorted.map((id, index) => [id, index]));
+  for (const [id, nextIds] of Array.from(criticalSuccessors.entries())) {
+    nextIds.sort((a, b) => (topoIndex.get(a) ?? 0) - (topoIndex.get(b) ?? 0));
+    criticalSuccessors.set(id, nextIds);
+  }
+
+  const criticalRoots = criticalTaskIds.filter(
+    (id) => (criticalIncoming.get(id) || []).length === 0
+  );
+
+  const criticalPaths: number[][] = [];
+  const dfs = (path: number[], currentId: number) => {
+    const nextIds = criticalSuccessors.get(currentId) || [];
+    if (nextIds.length === 0) {
+      criticalPaths.push(path);
+      return;
+    }
+    for (const nextId of nextIds) {
+      dfs([...path, nextId], nextId);
+    }
+  };
+
+  for (const rootId of criticalRoots) {
+    dfs([rootId], rootId);
+  }
+
+  const criticalPath =
+    criticalPaths.sort((a, b) => {
+      if (b.length !== a.length) return b.length - a.length;
+      return (topoIndex.get(a[0]) ?? 0) - (topoIndex.get(b[0]) ?? 0);
+    })[0] || [];
+
+  for (const id of sorted) {
+    if (!slackMs.has(id)) {
+      const slack =
+        (latestStart.get(id)?.getTime() ?? 0) -
+        (earliestStart.get(id)?.getTime() ?? 0);
+      slackMs.set(id, slack);
+    }
+  }
+
+  return {
+    earliestStart,
+    earliestFinish,
+    latestStart,
+    latestFinish,
+    slackMs,
+    criticalEdgeIds,
+    criticalPath,
+    criticalPaths,
+    criticalTaskIds,
+    projectFinish,
+    projectStart: baseline,
+  };
 }
 
 /** DFS reachability check — returns true if `from` can reach `to` through edges */

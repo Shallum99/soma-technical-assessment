@@ -14,19 +14,20 @@ import type { Todo } from "@/lib/types";
 
 interface DependencyGraphProps {
   todos: Todo[];
-  criticalPath: number[];
+  criticalTaskIds: number[];
+  criticalEdgeIds: string[];
 }
 
-export function DependencyGraph({ todos, criticalPath }: DependencyGraphProps) {
-  const criticalSet = useMemo(() => new Set(criticalPath), [criticalPath]);
-
-  const criticalEdges = useMemo(() => {
-    const edges = new Set<string>();
-    for (let i = 0; i < criticalPath.length - 1; i++) {
-      edges.add(`${criticalPath[i]}-${criticalPath[i + 1]}`);
-    }
-    return edges;
-  }, [criticalPath]);
+export function DependencyGraph({
+  todos,
+  criticalTaskIds,
+  criticalEdgeIds,
+}: DependencyGraphProps) {
+  const criticalSet = useMemo(() => new Set(criticalTaskIds), [criticalTaskIds]);
+  const criticalEdges = useMemo(
+    () => new Set(criticalEdgeIds),
+    [criticalEdgeIds]
+  );
 
   const { nodes, edges } = useMemo(() => {
     // Only include tasks that are part of the dependency graph
