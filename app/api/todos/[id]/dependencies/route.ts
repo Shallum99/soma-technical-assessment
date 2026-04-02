@@ -1,35 +1,11 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { wouldCreateCycle } from '@/lib/graph';
 
 interface Params {
   params: {
     id: string;
   };
-}
-
-// Check if adding a dependency would create a circular reference
-async function wouldCreateCycle(todoId: number, dependsOnId: number): Promise<boolean> {
-  // BFS from dependsOnId: if we can reach todoId, adding the edge would create a cycle
-  const visited = new Set<number>();
-  const queue = [dependsOnId];
-
-  while (queue.length > 0) {
-    const current = queue.shift()!;
-    if (current === todoId) return true;
-    if (visited.has(current)) continue;
-    visited.add(current);
-
-    const deps = await prisma.todoDependency.findMany({
-      where: { todoId: current },
-      select: { dependsOnId: true },
-    });
-
-    for (const dep of deps) {
-      queue.push(dep.dependsOnId);
-    }
-  }
-
-  return false;
 }
 
 export async function POST(request: Request, { params }: Params) {
@@ -59,9 +35,12 @@ export async function POST(request: Request, { params }: Params) {
       return NextResponse.json({ error: 'Todo not found' }, { status: 404 });
     }
 
-    // Check for circular dependency
-    const cycle = await wouldCreateCycle(todoId, dependsOnId);
-    if (cycle) {
+    // Load all edges at once and check for cycles in memory (no N+1)
+    const allEdges = await prisma.todoDependency.findMany({
+      select: { todoId: true, dependsOnId: true },
+    });
+
+    if (wouldCreateCycle(todoId, dependsOnId, allEdges)) {
       return NextResponse.json(
         { error: 'Adding this dependency would create a circular reference' },
         { status: 400 }
@@ -74,8 +53,8 @@ export async function POST(request: Request, { params }: Params) {
     });
 
     return NextResponse.json(dependency, { status: 201 });
-  } catch (error: any) {
-    if (error.code === 'P2002') {
+  } catch (e: unknown) {
+    if (e && typeof e === "object" && "code" in e && e.code === 'P2002') {
       return NextResponse.json({ error: 'Dependency already exists' }, { status: 409 });
     }
     return NextResponse.json({ error: 'Error creating dependency' }, { status: 500 });
@@ -96,7 +75,7 @@ export async function DELETE(request: Request, { params }: Params) {
     });
 
     return NextResponse.json({ message: 'Dependency removed' });
-  } catch (error) {
+  } catch {
     return NextResponse.json({ error: 'Error removing dependency' }, { status: 500 });
   }
 }

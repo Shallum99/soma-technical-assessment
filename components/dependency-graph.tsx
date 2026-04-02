@@ -10,24 +10,7 @@ import ReactFlow, {
 } from "reactflow";
 import "reactflow/dist/style.css";
 import { Badge } from "@/components/ui/badge";
-
-interface Todo {
-  id: number;
-  title: string;
-  dueDate: string | null;
-  imageUrl: string | null;
-  createdAt: string;
-  dependsOn: {
-    id: number;
-    dependsOnId: number;
-    dependsOn: { id: number; title: string };
-  }[];
-  dependedBy: {
-    id: number;
-    todoId: number;
-    todo: { id: number; title: string };
-  }[];
-}
+import type { Todo } from "@/lib/types";
 
 interface DependencyGraphProps {
   todos: Todo[];
@@ -46,7 +29,7 @@ export function DependencyGraph({ todos, criticalPath }: DependencyGraphProps) {
   }, [criticalPath]);
 
   const { nodes, edges } = useMemo(() => {
-    // Only include tasks that are part of the dependency graph (have deps or are depended on)
+    // Only include tasks that are part of the dependency graph
     const connectedIds = new Set<number>();
     for (const t of todos) {
       if (t.dependsOn.length > 0 || t.dependedBy.length > 0) {
@@ -60,30 +43,74 @@ export function DependencyGraph({ todos, criticalPath }: DependencyGraphProps) {
     const todoMap = new Map<number, Todo>();
     for (const t of connectedTodos) todoMap.set(t.id, t);
 
-    // Compute levels (distance from root nodes)
+    // Compute levels (distance from root nodes) using memoized iterative approach
     const levels = new Map<number, number>();
-    const computeLevel = (id: number, visited: Set<number>): number => {
-      if (levels.has(id)) return levels.get(id)!;
-      if (visited.has(id)) return 0;
-      visited.add(id);
-      const todo = todoMap.get(id);
-      if (!todo || todo.dependsOn.length === 0) {
-        levels.set(id, 0);
-        return 0;
-      }
-      let maxDepLevel = 0;
-      for (const dep of todo.dependsOn) {
-        if (connectedIds.has(dep.dependsOnId)) {
-          maxDepLevel = Math.max(
-            maxDepLevel,
-            computeLevel(dep.dependsOnId, new Set(visited)) + 1
-          );
+
+    const computeLevel = (startId: number): number => {
+      if (levels.has(startId)) return levels.get(startId)!;
+
+      // Iterative DFS with post-order processing
+      const stack: { id: number; phase: "enter" | "exit" }[] = [
+        { id: startId, phase: "enter" },
+      ];
+      const visiting = new Set<number>();
+
+      while (stack.length > 0) {
+        const { id, phase } = stack[stack.length - 1];
+
+        if (levels.has(id)) {
+          stack.pop();
+          continue;
+        }
+
+        if (phase === "enter") {
+          if (visiting.has(id)) {
+            // Cycle detected — treat as root to avoid infinite loop
+            levels.set(id, 0);
+            stack.pop();
+            continue;
+          }
+          visiting.add(id);
+
+          const todo = todoMap.get(id);
+          if (!todo || todo.dependsOn.length === 0) {
+            levels.set(id, 0);
+            stack.pop();
+            continue;
+          }
+
+          // Switch to exit phase
+          stack[stack.length - 1] = { id, phase: "exit" };
+
+          // Push dependencies to process first
+          for (const dep of todo.dependsOn) {
+            if (connectedIds.has(dep.dependsOnId) && !levels.has(dep.dependsOnId)) {
+              stack.push({ id: dep.dependsOnId, phase: "enter" });
+            }
+          }
+        } else {
+          // Exit phase — all deps are computed
+          stack.pop();
+          const todo = todoMap.get(id);
+          let maxDepLevel = 0;
+          if (todo) {
+            for (const dep of todo.dependsOn) {
+              if (connectedIds.has(dep.dependsOnId)) {
+                maxDepLevel = Math.max(
+                  maxDepLevel,
+                  (levels.get(dep.dependsOnId) || 0) + 1
+                );
+              }
+            }
+          }
+          levels.set(id, maxDepLevel);
         }
       }
-      levels.set(id, maxDepLevel);
-      return maxDepLevel;
+
+      return levels.get(startId) || 0;
     };
-    for (const t of connectedTodos) computeLevel(t.id, new Set());
+
+    for (const t of connectedTodos) computeLevel(t.id);
 
     // Group by level
     const levelGroups = new Map<number, Todo[]>();
@@ -194,7 +221,7 @@ export function DependencyGraph({ todos, criticalPath }: DependencyGraphProps) {
   }
 
   return (
-    <div className="w-full h-[500px] border rounded-lg bg-white">
+    <div className="w-full h-[500px] border rounded-lg bg-white" role="img" aria-label="Task dependency graph">
       <ReactFlow
         nodes={nodes}
         edges={edges}

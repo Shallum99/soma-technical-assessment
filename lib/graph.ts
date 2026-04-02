@@ -8,7 +8,8 @@ export interface TodoNode {
   dependsOn: { dependsOnId: number }[];
 }
 
-const TASK_DURATION_MS = 24 * 60 * 60 * 1000; // 1 day
+// Each task is assumed to take 1 day for scheduling purposes
+const TASK_DURATION_MS = 24 * 60 * 60 * 1000;
 
 /** Kahn's algorithm — returns topological order or null if cycle exists */
 export function topologicalSort(todos: TodoNode[]): number[] | null {
@@ -25,14 +26,16 @@ export function topologicalSort(todos: TodoNode[]): number[] | null {
     }
   }
 
+  // Index-based queue avoids O(n) shift on each dequeue
   const queue: number[] = [];
-  Array.from(inDegree.entries()).forEach(([id, deg]) => {
+  inDegree.forEach((deg, id) => {
     if (deg === 0) queue.push(id);
   });
 
   const sorted: number[] = [];
-  while (queue.length > 0) {
-    const node = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const node = queue[head++];
     sorted.push(node);
     for (const neighbor of adjList.get(node) || []) {
       const newDeg = (inDegree.get(neighbor) || 1) - 1;
@@ -65,7 +68,7 @@ export function analyzeGraph(todos: TodoNode[]): GraphAnalysis {
   const sorted = topologicalSort(todos);
   if (!sorted) return empty;
 
-  // Forward pass
+  // Forward pass: compute earliest start/finish for each task
   const earliestStart = new Map<number, Date>();
   const earliestFinish = new Map<number, Date>();
 
@@ -82,7 +85,7 @@ export function analyzeGraph(todos: TodoNode[]): GraphAnalysis {
     earliestFinish.set(id, new Date(es.getTime() + TASK_DURATION_MS));
   }
 
-  // Find the task with the latest finish → end of critical path
+  // Find the task with the latest finish — end of critical path
   let latestFinishId = sorted[0];
   let latestFinishTime = earliestFinish.get(sorted[0]) || new Date();
   for (const id of sorted) {
@@ -93,30 +96,30 @@ export function analyzeGraph(todos: TodoNode[]): GraphAnalysis {
     }
   }
 
-  // Trace back from latest-finishing task along the critical predecessors
+  // Trace back iteratively from the latest-finishing task along critical predecessors
   const criticalPath: number[] = [];
-  const traceBack = (id: number) => {
-    criticalPath.unshift(id);
-    const todo = todoMap.get(id)!;
-    if (todo.dependsOn.length === 0) return;
+  let traceId: number | null = latestFinishId;
+  while (traceId !== null) {
+    criticalPath.unshift(traceId);
+    const traceNode: TodoNode = todoMap.get(traceId)!;
+    if (traceNode.dependsOn.length === 0) break;
 
-    let criticalPred = -1;
+    let criticalPred: number | null = null;
     let criticalFinish = new Date(0);
-    for (const dep of todo.dependsOn) {
+    for (const dep of traceNode.dependsOn) {
       const ef = earliestFinish.get(dep.dependsOnId) || new Date(0);
       if (ef >= criticalFinish) {
         criticalFinish = ef;
         criticalPred = dep.dependsOnId;
       }
     }
-    if (criticalPred !== -1) traceBack(criticalPred);
-  };
-  traceBack(latestFinishId);
+    traceId = criticalPred;
+  }
 
   return { earliestStart, earliestFinish, criticalPath };
 }
 
-/** DFS reachability check — returns true if `from` can reach `to` through existing edges */
+/** DFS reachability check — returns true if `from` can reach `to` through edges */
 export function canReach(
   from: number,
   to: number,
@@ -134,4 +137,23 @@ export function canReach(
     }
   }
   return false;
+}
+
+/**
+ * Check if adding edge (todoId depends on dependsOnId) would create a cycle.
+ * Takes the full edge list to run in-memory — no N+1 DB queries.
+ */
+export function wouldCreateCycle(
+  todoId: number,
+  dependsOnId: number,
+  edges: { todoId: number; dependsOnId: number }[]
+): boolean {
+  // Build adjacency: task → [tasks it depends on]
+  const adj = new Map<number, number[]>();
+  for (const e of edges) {
+    if (!adj.has(e.todoId)) adj.set(e.todoId, []);
+    adj.get(e.todoId)!.push(e.dependsOnId);
+  }
+  // If dependsOnId can reach todoId through existing deps, adding the edge creates a cycle
+  return canReach(dependsOnId, todoId, adj);
 }

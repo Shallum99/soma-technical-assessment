@@ -4,4 +4,5 @@ node_modules
 **/.DS_Store
 .env.local
 .env
+prisma/dev.db
 prisma/dev.db-journal

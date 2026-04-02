@@ -54,6 +54,8 @@ Implement a task dependency system that allows tasks to depend on other tasks. T
 
 Thanks for your time and effort. We'll be in touch soon!
 
+---
+
 ## Solution
 
 ### Setup
@@ -65,6 +67,7 @@ npm install
 Create a `.env.local` file with your Pexels API key:
 
 ```
+DATABASE_URL="file:./dev.db"
 PEXELS_API_KEY=your_key_here
 ```
 
@@ -74,64 +77,137 @@ Run the development server:
 npm run dev
 ```
 
+Optionally seed with example data (server must be running):
+
+```bash
+node seed.mjs 1    # Software project — 6 tasks, dependencies, critical path
+node seed.mjs 2    # Event planning — 5 tasks, overdue dates, completions
+node seed.mjs 3    # Home renovation — 7 tasks, long dependency chain
+node seed.mjs 4    # Startup launch — 8 tasks, multiple critical paths
+node seed.mjs 5    # Simple demo — 3 tasks, minimal
+```
+
+Run tests:
+
+```bash
+npm test
+```
+
 ### Screenshots
 
-**Task list** — inline image thumbnails, sortable columns, overdue dates in red, critical path badges:
+**Task list** — inline image thumbnails, sortable columns, overdue dates in red, critical path badges, task completion:
 
 ![Task list with due dates and inline images](screenshots/01-task-list.png)
 
-**Expanded row** — larger image preview (click to open full-size dialog), earliest start date, dependency management:
+**Expanded row** — larger image preview (click to open full-size dialog), earliest start date, dependency management with multi-select picker:
 
 ![Expanded row with image preview and dependencies](screenshots/02-expanded-row.png)
 
-**Dependency graph** — interactive React Flow visualization with critical path highlighted in orange:
+**Dependency graph** — interactive React Flow visualization with critical path highlighted in orange, animated edges, and critical path summary:
 
 ![Dependency graph with critical path](screenshots/03-dependency-graph.png)
 
+---
+
 ### Part 1: Due Dates
 
-- Added an optional `dueDate` field to the Todo model (Prisma/SQLite).
-- Inline date picker in the task creation row.
-- Sortable due date column in the task table — click to sort ascending/descending.
-- Overdue dates are highlighted in **red** with a warning icon for clear visual distinction.
+- Added an optional `dueDate` field to the Todo model via Prisma migration.
+- Inline date picker in the task creation row with `maxLength` validation.
+- Sortable due date column — click the header to toggle ascending/descending.
+- Overdue dates are highlighted in **red** with a warning icon. The comparison uses date-only logic (ignoring time) so a task due "today" does not appear overdue until tomorrow.
 
 ### Part 2: Image Previews (Pexels API)
 
-- When a todo is created, the server-side API route queries the Pexels API using the task title as a search query.
-- The first matching image URL is stored in the database and displayed as an **inline thumbnail** directly in each task row — visible without any extra clicks.
-- An **animated skeleton placeholder** is shown while each image loads in the browser, with a smooth opacity transition on load.
+- When a todo is created, the server action queries the Pexels API using the task title as a search query.
+- The first matching image URL is stored in the database and displayed as an **inline thumbnail** in each task row.
+- An **animated skeleton placeholder** is shown while each image loads, with a smooth opacity transition on completion. Handles cached images that fire `onLoad` before React mounts.
 - Clicking the thumbnail in the expanded row opens a **full-size preview dialog** (Radix Dialog).
-- An **animated spinner** loading state is shown on the Add button while the task and image are being fetched.
-- The Pexels API key is stored in `.env.local` (server-side only, never exposed to the client).
+- An **animated spinner** is shown on the Add button while the task and image are being fetched.
+- The Pexels API key is stored in `.env.local` and only accessed server-side — never exposed to the client.
 
 ### Part 3: Task Dependencies
 
-- **Data model**: A `TodoDependency` join table with a unique constraint on `(todoId, dependsOnId)` to prevent duplicate edges.
-- **Multiple dependencies**: Expanding a task row reveals a dependency section with **search-based dependency selector**. The dropdown opens on focus showing all valid options, and supports filtering by typing.
-- **Circular dependency prevention**: Cycle detection runs **both client-side** (DFS reachability — invalid options are filtered out of the selector entirely) **and server-side** (BFS traversal rejects the mutation with a clear error). This provides a seamless UX where users simply cannot select invalid dependencies.
-- **Critical path**: Computed client-side using topological sort (Kahn's algorithm) with a forward pass to find earliest start/finish times, then tracing back from the latest-finishing task to identify the longest path. Critical path tasks are highlighted with an orange badge and row tint.
-- **Earliest start dates**: Calculated for each task based on its dependency chain. Displayed in the expanded row detail for tasks that have dependencies, with a warning about critical path impact.
-- **Interactive dependency graph** (React Flow): Switching to the "Dependencies" tab shows a draggable, zoomable graph with:
-  - Hierarchical left-to-right layout by topological level
-  - Smooth animated edges on the critical path (orange, animated dash)
-  - Non-critical edges dimmed in gray
+- **Data model**: A `TodoDependency` join table with a unique constraint on `(todoId, dependsOnId)` to prevent duplicate edges. Cascade deletes ensure cleanup when a task is removed.
+
+- **Multiple dependencies**: Expanding a task row reveals a dependency section with a searchable multi-select picker. Select multiple targets with checkboxes and confirm with a single "Add N dependencies" button.
+
+- **Circular dependency prevention** — dual defense:
+  - **Client-side**: DFS reachability check (`canReach`) filters invalid options out of the picker entirely, so users never see an option that would create a cycle.
+  - **Server-side**: `wouldCreateCycle` loads all edges in a single query and runs an in-memory BFS check before creating the dependency. Returns a clear error if a cycle would result.
+
+- **Critical path**: Computed using Kahn's topological sort with a forward pass to calculate earliest start/finish times, then iterative traceback from the latest-finishing task to identify the longest dependency chain. Critical path tasks are highlighted with orange badges and row tinting. A summary strip below the table shows the full critical path sequence.
+
+- **Earliest start dates**: Calculated per task based on its dependency chain (each task assumed to take 1 day). Displayed in the expanded row for tasks with dependencies, along with a warning about critical path impact.
+
+- **Interactive dependency graph** (React Flow): The "Dependencies" tab shows a draggable, zoomable graph with:
+  - Hierarchical left-to-right layout computed by topological level
+  - Critical path nodes highlighted with orange borders and shadow
+  - Animated dashed edges on the critical path, dimmed gray edges elsewhere
   - Draggable nodes with zoom/pan controls
-  - Critical path summary badge strip below the graph
+  - Only connected tasks are shown (tasks without dependencies are hidden for clarity)
 
 ### Beyond the Requirements
 
-- **Task completion**: Click the circle icon to mark tasks done. Completed tasks show with strikethrough text and muted styling. Overdue indicators are hidden for completed tasks.
-- **Status filters**: Filter by All / Pending / Completed with live counts. Filter state is persisted in the URL via **nuqs** for shareability (e.g. `?status=pending&tab=dependencies`).
-- **Multi-select dependencies**: Select multiple dependency targets at once with checkboxes, then confirm with a single "Add N dependencies" button.
-- **Server Components + Server Actions**: The page is a server component that fetches data server-side (no client-side waterfall). All mutations run as server actions. REST API routes are also available for programmatic access.
-- **Optimistic UI**: Toggling task completion updates instantly before the server round-trip.
+- **Task completion**: Click the circle icon to mark tasks done. Completed tasks show strikethrough text and muted styling. Overdue indicators are hidden for completed tasks. Uses optimistic UI with rollback on server failure.
+- **Status filters**: Filter by All / Pending / Completed with live counts. Filter state is persisted in the URL via nuqs (e.g., `?status=pending&tab=dependencies`).
+- **Delete confirmation**: Styled modal dialog instead of browser `confirm()` for consistent UX.
+- **Error boundary**: Wraps the app to catch render errors gracefully instead of white-screening.
+- **Loading states**: Spinner on the Add button during task creation, spinner and disabled controls during dependency add/remove operations, dimmed rows during optimistic transitions.
+- **Accessibility**: `aria-label` on all interactive controls (toggle, sort, delete, filter, search), `role="alert"` on error messages, `aria-pressed` on filter buttons, `aria-expanded` on expandable rows.
+- **Input validation**: Title trimming and 500-character max length enforced server-side.
+- **Form semantics**: Add-task inputs wrapped in a `<form>` element with `onSubmit`.
 
-### Tech Choices
+### Testing
 
-- **Server Components + Server Actions**: Data fetching via Prisma with no client-side waterfall; only interactive leaves are client components
-- **shadcn/ui** (Radix + Tailwind + CVA): Consistent, accessible component library (Button, Badge, Tabs, Dialog)
-- **React Flow**: Interactive dependency graph with pan/zoom, drag, and animated edges
-- **nuqs**: Tab and filter state persisted in the URL for shareability
-- **Prisma + SQLite**: Simple relational backend with typed ORM
-- **Pure graph functions** (`lib/graph.ts`): Topological sort, critical path, and reachability as testable pure functions
-- **Lucide icons**: Consistent iconography throughout
+30 unit tests covering the graph algorithm library (`lib/graph.ts`):
+
+- **`topologicalSort`** — empty input, single node, linear chains, diamond dependencies, cycles, multiple independent chains, multi-dependency nodes
+- **`canReach`** — direct edges, transitive paths, unreachable nodes, reverse direction, cycle handling
+- **`wouldCreateCycle`** — no edges, direct back-edges, transitive cycles, parallel chains, diamond cycles
+- **`analyzeGraph`** — empty input, single-node critical path, linear chains, earliest start calculation, diamond path selection, longer branch selection, cyclic input, independent tasks, `createdAt` baseline handling
+
+```bash
+npm test          # run once
+npm run test:watch  # watch mode
+```
+
+### Architecture
+
+```
+app/
+  page.tsx              Server component — fetches todos, passes to client
+  layout.tsx            Root layout with NuqsAdapter + ErrorBoundary
+  actions/todos.ts      Server actions for all mutations (create, delete, toggle, deps)
+  api/todos/            REST API routes (kept for programmatic/external access)
+
+components/
+  todo-app.tsx          Main client component — state, handlers, UI orchestration
+  dependency-graph.tsx  React Flow visualization with hierarchical layout
+  error-boundary.tsx    Class-based error boundary with retry
+  ui/                   shadcn/ui primitives (Button, Badge, Dialog, Tabs)
+
+lib/
+  graph.ts              Pure functions: topologicalSort, analyzeGraph, canReach, wouldCreateCycle
+  types.ts              Shared TypeScript interfaces (Todo, SortField, SortDir)
+  prisma.ts             Prisma client singleton
+  pexels.ts             Pexels API integration
+  utils.ts              cn() utility (clsx + tailwind-merge)
+
+prisma/
+  schema.prisma         Todo + TodoDependency models with cascade deletes
+
+__tests__/
+  graph.test.ts         30 tests for graph algorithms (vitest)
+```
+
+### Tech Stack
+
+| Layer | Choice | Why |
+|-------|--------|-----|
+| Framework | Next.js 14 (App Router) | Server components + server actions eliminate client-side data waterfalls |
+| Database | Prisma + SQLite | Type-safe ORM with simple file-based DB, zero config |
+| UI | shadcn/ui (Radix + Tailwind + CVA) | Accessible primitives with consistent styling |
+| Graph viz | React Flow | Interactive pan/zoom/drag with animated edges |
+| URL state | nuqs | Tab and filter state shareable via URL |
+| Icons | Lucide | Consistent, tree-shakeable icon set |
+| Testing | Vitest | Fast, TypeScript-native, zero-config test runner |

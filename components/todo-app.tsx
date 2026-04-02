@@ -1,5 +1,12 @@
 "use client";
-import { useState, useEffect, useMemo, useCallback, useTransition, useRef } from "react";
+import {
+  useState,
+  useEffect,
+  useMemo,
+  useCallback,
+  useTransition,
+  useRef,
+} from "react";
 import { useQueryState } from "nuqs";
 import {
   ChevronDown,
@@ -21,9 +28,9 @@ import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import {
   Dialog,
-  DialogTrigger,
   DialogContent,
   DialogTitle,
+  DialogTrigger,
 } from "@/components/ui/dialog";
 import { DependencyGraph } from "@/components/dependency-graph";
 import { analyzeGraph, canReach } from "@/lib/graph";
@@ -31,38 +38,23 @@ import {
   createTodo,
   deleteTodo,
   toggleTodo,
-  addDependency,
   removeDependency,
   addMultipleDependencies,
   getTodos,
 } from "@/app/actions/todos";
-
-// ─── Types ───────────────────────────────────────────────────────────────────
-interface Todo {
-  id: number;
-  title: string;
-  completed: boolean;
-  dueDate: string | null;
-  imageUrl: string | null;
-  createdAt: string;
-  dependsOn: {
-    id: number;
-    dependsOnId: number;
-    dependsOn: { id: number; title: string };
-  }[];
-  dependedBy: {
-    id: number;
-    todoId: number;
-    todo: { id: number; title: string };
-  }[];
-}
-
-type SortField = "title" | "dueDate" | "createdAt";
-type SortDir = "asc" | "desc";
-type StatusFilter = "all" | "pending" | "completed";
+import type { Todo, SortField, SortDir } from "@/lib/types";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-const isOverdue = (d: string) => new Date(d) < new Date();
+
+/** Compare date portions only (ignoring time) so "due today" is not overdue */
+const isOverdue = (d: string) => {
+  const due = new Date(d);
+  const now = new Date();
+  return (
+    new Date(due.getFullYear(), due.getMonth(), due.getDate()) <
+    new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  );
+};
 
 const formatDate = (d: string) =>
   new Date(d).toLocaleDateString("en-US", {
@@ -92,9 +84,17 @@ function ImageWithSkeleton({
 }) {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState(false);
+  const imgRef = useRef<HTMLImageElement>(null);
+
+  // Handle cached images where onLoad fires before React mounts
+  useEffect(() => {
+    if (imgRef.current?.complete && imgRef.current?.naturalHeight > 0) {
+      setLoaded(true);
+    }
+  }, []);
 
   return (
-    <div className={`relative ${className || ""}`}>
+    <div className={`relative overflow-hidden ${className || ""}`}>
       {!loaded && !error && (
         <div className="absolute inset-0 bg-gray-200 animate-pulse rounded" />
       )}
@@ -104,6 +104,7 @@ function ImageWithSkeleton({
         </div>
       ) : (
         <img
+          ref={imgRef}
           src={src}
           alt={alt}
           className={`w-full h-full object-cover rounded ${loaded ? "opacity-100" : "opacity-0"} transition-opacity duration-200`}
@@ -173,7 +174,9 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
   const [depSearch, setDepSearch] = useState("");
   const [depDropdownOpen, setDepDropdownOpen] = useState(false);
   const [selectedDeps, setSelectedDeps] = useState<Set<number>>(new Set());
+  const [depLoading, setDepLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
   const [isPending, startTransition] = useTransition();
 
   // nuqs — URL-persisted state
@@ -196,7 +199,10 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
   const depDropdownRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const handler = (e: MouseEvent) => {
-      if (depDropdownRef.current && !depDropdownRef.current.contains(e.target as Node)) {
+      if (
+        depDropdownRef.current &&
+        !depDropdownRef.current.contains(e.target as Node)
+      ) {
         setDepDropdownOpen(false);
       }
     };
@@ -290,25 +296,33 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
   };
 
   const handleToggle = (id: number, completed: boolean) => {
+    const previousTodos = todos;
     // Optimistic update
     setTodos((prev) =>
       prev.map((t) => (t.id === id ? { ...t, completed } : t))
     );
     startTransition(async () => {
-      await toggleTodo(id, completed);
+      const result = await toggleTodo(id, completed);
+      if (result.error) {
+        // Rollback on failure
+        setTodos(previousTodos);
+        setError(result.error);
+        return;
+      }
       await refresh();
     });
   };
 
-  const handleDelete = async (id: number) => {
-    if (
-      !window.confirm(
-        "Delete this task? This will also remove its dependencies."
-      )
-    )
-      return;
+  const handleDeleteConfirm = async () => {
+    if (confirmDeleteId === null) return;
+    const id = confirmDeleteId;
+    setConfirmDeleteId(null);
     try {
-      await deleteTodo(id);
+      const result = await deleteTodo(id);
+      if (result.error) {
+        setError(result.error);
+        return;
+      }
       if (expandedId === id) setExpandedId(null);
       await refresh();
     } catch {
@@ -319,6 +333,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
   const handleAddDeps = async (todoId: number) => {
     if (selectedDeps.size === 0) return;
     setError(null);
+    setDepLoading(true);
     try {
       const results = await addMultipleDependencies(
         todoId,
@@ -333,15 +348,20 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
       await refresh();
     } catch {
       setError("Failed to add dependencies.");
+    } finally {
+      setDepLoading(false);
     }
   };
 
   const handleRemoveDep = async (todoId: number, depId: number) => {
+    setDepLoading(true);
     try {
       await removeDependency(todoId, depId);
       await refresh();
     } catch {
       setError("Failed to remove dependency.");
+    } finally {
+      setDepLoading(false);
     }
   };
 
@@ -375,15 +395,22 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
       <main className="max-w-5xl mx-auto px-6 py-6 space-y-6">
         {/* Add task row */}
         <div className="bg-white border rounded-lg shadow-sm p-4">
-          <div className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center">
+          <form
+            className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center"
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleAdd();
+            }}
+          >
             <input
               type="text"
               className="flex-grow h-10 px-3 rounded-md border border-input bg-background text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               placeholder="What needs to be done?"
               value={newTitle}
               onChange={(e) => setNewTitle(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleAdd()}
               disabled={loading}
+              aria-label="New task title"
+              maxLength={500}
             />
             <input
               type="date"
@@ -391,8 +418,9 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
               value={newDueDate}
               onChange={(e) => setNewDueDate(e.target.value)}
               disabled={loading}
+              aria-label="Due date"
             />
-            <Button onClick={handleAdd} disabled={loading || !newTitle.trim()}>
+            <Button type="submit" disabled={loading || !newTitle.trim()}>
               {loading ? (
                 <span className="flex items-center gap-2">
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -404,15 +432,21 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                 </span>
               )}
             </Button>
-          </div>
+          </form>
         </div>
 
         {/* Error */}
         {error && (
-          <div className="flex items-center gap-2 bg-red-50 text-red-700 text-sm border border-red-200 rounded-lg px-4 py-3">
+          <div
+            className="flex items-center gap-2 bg-red-50 text-red-700 text-sm border border-red-200 rounded-lg px-4 py-3"
+            role="alert"
+          >
             <AlertTriangle className="h-4 w-4 flex-shrink-0" />
             <span className="flex-grow">{error}</span>
-            <button onClick={() => setError(null)}>
+            <button
+              onClick={() => setError(null)}
+              aria-label="Dismiss error"
+            >
               <X className="h-4 w-4" />
             </button>
           </div>
@@ -428,7 +462,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
 
             {/* Status filter (only on tasks tab) */}
             {(tab === "tasks" || !tab) && (
-              <div className="flex gap-1">
+              <div className="flex gap-1" role="group" aria-label="Filter tasks by status">
                 {(
                   [
                     ["all", "All", todos.length],
@@ -439,6 +473,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                   <button
                     key={value}
                     onClick={() => setStatusFilter(value)}
+                    aria-pressed={statusFilter === value}
                     className={`px-3 py-1.5 text-xs font-medium rounded-full transition-colors ${
                       statusFilter === value
                         ? "bg-primary text-primary-foreground"
@@ -468,12 +503,16 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                 <div className="overflow-x-auto">
                   <div className="min-w-[640px]">
                     {/* Table header */}
-                    <div className="grid grid-cols-[32px_48px_1fr_140px_140px_48px] gap-2 px-4 py-3 border-b bg-gray-50 text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                    <div
+                      className="grid grid-cols-[32px_48px_1fr_140px_140px_48px] gap-2 px-4 py-3 border-b bg-gray-50 text-xs font-medium text-muted-foreground uppercase tracking-wider"
+                      role="row"
+                    >
                       <span />
                       <span />
                       <button
                         className="text-left flex items-center hover:text-foreground"
                         onClick={() => handleSort("title")}
+                        aria-label={`Sort by title ${sortField === "title" ? (sortDir === "asc" ? "descending" : "ascending") : "ascending"}`}
                       >
                         Task
                         <SortIndicator
@@ -485,6 +524,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                       <button
                         className="text-left flex items-center hover:text-foreground"
                         onClick={() => handleSort("dueDate")}
+                        aria-label={`Sort by due date ${sortField === "dueDate" ? (sortDir === "asc" ? "descending" : "ascending") : "ascending"}`}
                       >
                         Due Date
                         <SortIndicator
@@ -496,6 +536,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                       <button
                         className="text-left flex items-center hover:text-foreground"
                         onClick={() => handleSort("createdAt")}
+                        aria-label={`Sort by created date ${sortField === "createdAt" ? (sortDir === "asc" ? "descending" : "ascending") : "ascending"}`}
                       >
                         Created
                         <SortIndicator
@@ -540,10 +581,12 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                         >
                           {/* Main row */}
                           <div
-                            className="grid grid-cols-[32px_48px_1fr_140px_140px_48px] gap-2 px-4 py-3 items-center hover:bg-gray-50/50 cursor-pointer"
+                            className={`grid grid-cols-[32px_48px_1fr_140px_140px_48px] gap-2 px-4 py-3 items-center hover:bg-gray-50/50 cursor-pointer ${isPending ? "opacity-70" : ""}`}
                             onClick={() =>
                               setExpandedId(expanded ? null : todo.id)
                             }
+                            role="row"
+                            aria-expanded={expanded}
                           >
                             {/* Completion toggle */}
                             <button
@@ -556,6 +599,11 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                   ? "text-green-500"
                                   : "text-gray-300 hover:text-gray-500"
                               }`}
+                              aria-label={
+                                todo.completed
+                                  ? `Mark "${todo.title}" as incomplete`
+                                  : `Mark "${todo.title}" as complete`
+                              }
                             >
                               {todo.completed ? (
                                 <CheckCircle2 className="h-5 w-5" />
@@ -653,8 +701,9 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                 className="h-8 w-8 text-muted-foreground hover:text-red-600"
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  handleDelete(todo.id);
+                                  setConfirmDeleteId(todo.id);
                                 }}
+                                aria-label={`Delete "${todo.title}"`}
                               >
                                 <Trash2 className="h-4 w-4" />
                               </Button>
@@ -674,7 +723,10 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                   {todo.imageUrl ? (
                                     <Dialog>
                                       <DialogTrigger asChild>
-                                        <button className="block w-full overflow-hidden rounded-lg border hover:ring-2 hover:ring-ring transition-all">
+                                        <button
+                                          className="block w-full overflow-hidden rounded-lg border hover:ring-2 hover:ring-ring transition-all"
+                                          aria-label="Open full-size image preview"
+                                        >
                                           <ImageWithSkeleton
                                             src={todo.imageUrl}
                                             alt={todo.title}
@@ -730,6 +782,9 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                   <div>
                                     <h4 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1">
                                       <Link2 className="h-3 w-3" /> Dependencies
+                                      {depLoading && (
+                                        <Loader2 className="h-3 w-3 animate-spin ml-1" />
+                                      )}
                                     </h4>
                                     {todo.dependsOn.length > 0 ? (
                                       <div className="flex flex-wrap gap-1.5 mb-2">
@@ -748,6 +803,8 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                                 )
                                               }
                                               className="ml-0.5 rounded-full hover:bg-gray-300 p-0.5"
+                                              disabled={depLoading}
+                                              aria-label={`Remove dependency on "${dep.dependsOn.title}"`}
                                             >
                                               <X className="h-3 w-3" />
                                             </button>
@@ -762,7 +819,10 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
 
                                     {/* Multi-select dependency picker */}
                                     {availableDeps.length > 0 && (
-                                      <div className="relative" ref={depDropdownRef}>
+                                      <div
+                                        className="relative"
+                                        ref={depDropdownRef}
+                                      >
                                         <input
                                           type="text"
                                           className="w-full h-8 px-2 text-sm rounded-md border border-input bg-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
@@ -775,6 +835,8 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                             setDepDropdownOpen(true)
                                           }
                                           onClick={(e) => e.stopPropagation()}
+                                          disabled={depLoading}
+                                          aria-label="Search dependencies"
                                         />
                                         {depDropdownOpen &&
                                           filteredDeps.length > 0 && (
@@ -811,12 +873,17 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                                   <Button
                                                     size="sm"
                                                     className="w-full"
+                                                    disabled={depLoading}
                                                     onClick={(e) => {
                                                       e.stopPropagation();
                                                       handleAddDeps(todo.id);
                                                     }}
                                                   >
-                                                    <Plus className="h-3 w-3 mr-1" />
+                                                    {depLoading ? (
+                                                      <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                                                    ) : (
+                                                      <Plus className="h-3 w-3 mr-1" />
+                                                    )}
                                                     Add {selectedDeps.size}{" "}
                                                     dependenc
                                                     {selectedDeps.size > 1
@@ -851,7 +918,9 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
               </div>
             )}
 
-            <CriticalPathSummary criticalPath={criticalPath} todos={todos} />
+            <div className="mt-4">
+              <CriticalPathSummary criticalPath={criticalPath} todos={todos} />
+            </div>
           </TabsContent>
 
           {/* Dependencies tab */}
@@ -863,6 +932,33 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
           </TabsContent>
         </Tabs>
       </main>
+
+      {/* Delete confirmation dialog */}
+      <Dialog
+        open={confirmDeleteId !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmDeleteId(null);
+        }}
+      >
+        <DialogContent>
+          <DialogTitle>Delete Task</DialogTitle>
+          <p className="text-sm text-muted-foreground">
+            This will permanently delete this task and remove its dependencies.
+            This action cannot be undone.
+          </p>
+          <div className="flex justify-end gap-2 mt-4">
+            <Button
+              variant="outline"
+              onClick={() => setConfirmDeleteId(null)}
+            >
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={handleDeleteConfirm}>
+              Delete
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
