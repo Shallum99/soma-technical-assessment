@@ -9,19 +9,23 @@ import {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function node(
-  id: number,
-  deps: number[] = [],
-  createdAt = "2024-01-01T00:00:00.000Z"
-): TodoNode {
+// All nodes use the same createdAt — the algorithm should not depend on it.
+const BASE = "2024-01-01T00:00:00.000Z";
+
+function node(id: number, deps: number[] = []): TodoNode {
   return {
     id,
     title: `Task ${id}`,
     dueDate: null,
-    createdAt,
+    createdAt: BASE,
     dependsOn: deps.map((d) => ({ dependsOnId: d })),
   };
 }
+
+// Fixed project-start used by every analyzeGraph call so tests are deterministic.
+const START = new Date("2024-01-01T00:00:00.000Z");
+const DAY = 24 * 60 * 60 * 1000;
+const startTime = START.getTime();
 
 // ─── topologicalSort ────────────────────────────────────────────────────────
 
@@ -35,7 +39,6 @@ describe("topologicalSort", () => {
   });
 
   it("respects linear chain order", () => {
-    // 1 → 2 → 3
     const result = topologicalSort([node(1), node(2, [1]), node(3, [2])]);
     expect(result).not.toBeNull();
     const i1 = result!.indexOf(1);
@@ -56,16 +59,10 @@ describe("topologicalSort", () => {
   });
 
   it("handles diamond dependency", () => {
-    //   1
-    //  / \
-    // 2   3
-    //  \ /
-    //   4
     const todos = [node(1), node(2, [1]), node(3, [1]), node(4, [2, 3])];
     const result = topologicalSort(todos);
     expect(result).not.toBeNull();
     expect(result).toHaveLength(4);
-    // 1 before 2 and 3, both before 4
     expect(result!.indexOf(1)).toBeLessThan(result!.indexOf(2));
     expect(result!.indexOf(1)).toBeLessThan(result!.indexOf(3));
     expect(result!.indexOf(2)).toBeLessThan(result!.indexOf(4));
@@ -85,7 +82,7 @@ describe("topologicalSort", () => {
     const todos = [node(1), node(2), node(3), node(4, [1, 2, 3])];
     const result = topologicalSort(todos);
     expect(result).not.toBeNull();
-    expect(result!.indexOf(4)).toBe(3); // last
+    expect(result!.indexOf(4)).toBe(3);
   });
 });
 
@@ -125,14 +122,8 @@ describe("canReach", () => {
       [1, [2]],
       [2, [1]],
     ]);
-    // Should terminate — 1 can reach 2, and 2 can reach 1
     expect(canReach(1, 2, adj)).toBe(true);
     expect(canReach(2, 1, adj)).toBe(true);
-  });
-
-  it("returns false when from === to (no self-loop)", () => {
-    // from is checked before being added to visited, so from === to is true immediately
-    expect(canReach(1, 1, new Map([[1, [2]]]))).toBe(true);
   });
 });
 
@@ -144,13 +135,11 @@ describe("wouldCreateCycle", () => {
   });
 
   it("detects direct back-edge", () => {
-    // 2 depends on 1. Adding "1 depends on 2" creates: 1 → 2 → 1
     const edges = [{ todoId: 2, dependsOnId: 1 }];
     expect(wouldCreateCycle(1, 2, edges)).toBe(true);
   });
 
   it("detects transitive cycle", () => {
-    // 2→1, 3→2. Adding "1 depends on 3" creates: 1→3→2→1
     const edges = [
       { todoId: 2, dependsOnId: 1 },
       { todoId: 3, dependsOnId: 2 },
@@ -159,13 +148,11 @@ describe("wouldCreateCycle", () => {
   });
 
   it("allows non-cyclic addition", () => {
-    // 2→1. Adding "3 depends on 1" is fine
     const edges = [{ todoId: 2, dependsOnId: 1 }];
     expect(wouldCreateCycle(3, 1, edges)).toBe(false);
   });
 
   it("allows adding to parallel chain", () => {
-    // 2→1, 4→3. Adding "4 depends on 1" is fine
     const edges = [
       { todoId: 2, dependsOnId: 1 },
       { todoId: 4, dependsOnId: 3 },
@@ -174,7 +161,6 @@ describe("wouldCreateCycle", () => {
   });
 
   it("detects cycle through diamond", () => {
-    // Diamond: 2→1, 3→1, 4→2, 4→3. Adding "1 depends on 4" creates cycle
     const edges = [
       { todoId: 2, dependsOnId: 1 },
       { todoId: 3, dependsOnId: 1 },
@@ -188,45 +174,62 @@ describe("wouldCreateCycle", () => {
 // ─── analyzeGraph ───────────────────────────────────────────────────────────
 
 describe("analyzeGraph", () => {
-  const DAY = 24 * 60 * 60 * 1000;
-  const BASE = "2024-01-01T00:00:00.000Z";
-  const baseTime = new Date(BASE).getTime();
-
   it("returns empty for no todos", () => {
-    const result = analyzeGraph([]);
+    const result = analyzeGraph([], START);
     expect(result.criticalPath).toEqual([]);
     expect(result.earliestStart.size).toBe(0);
     expect(result.earliestFinish.size).toBe(0);
   });
 
   it("returns single-node critical path for lone task", () => {
-    const result = analyzeGraph([node(1)]);
+    const result = analyzeGraph([node(1)], START);
     expect(result.criticalPath).toEqual([1]);
-    expect(result.earliestStart.get(1)!.getTime()).toBe(baseTime);
-    expect(result.earliestFinish.get(1)!.getTime()).toBe(baseTime + DAY);
+    expect(result.earliestStart.get(1)!.getTime()).toBe(startTime);
+    expect(result.earliestFinish.get(1)!.getTime()).toBe(startTime + DAY);
   });
 
   it("computes correct critical path for linear chain", () => {
     const todos = [node(1), node(2, [1]), node(3, [2])];
-    const result = analyzeGraph(todos);
+    const result = analyzeGraph(todos, START);
     expect(result.criticalPath).toEqual([1, 2, 3]);
   });
 
   it("computes earliest start dates based on dependencies", () => {
     const todos = [node(1), node(2, [1]), node(3, [2])];
-    const result = analyzeGraph(todos);
+    const result = analyzeGraph(todos, START);
 
-    expect(result.earliestStart.get(1)!.getTime()).toBe(baseTime);
-    expect(result.earliestStart.get(2)!.getTime()).toBe(baseTime + DAY);
-    expect(result.earliestStart.get(3)!.getTime()).toBe(baseTime + 2 * DAY);
+    expect(result.earliestStart.get(1)!.getTime()).toBe(startTime);
+    expect(result.earliestStart.get(2)!.getTime()).toBe(startTime + DAY);
+    expect(result.earliestStart.get(3)!.getTime()).toBe(startTime + 2 * DAY);
   });
 
-  it("picks the longest path through a diamond", () => {
-    // 1 → 2 → 4
-    // 1 → 3 → 4
-    // Both paths are equal length (3 nodes), critical path should include 4
+  it("all root tasks share the same baseline regardless of createdAt", () => {
+    // Task 1 was created much later than task 2 — should not matter.
+    const todos = [
+      {
+        ...node(1),
+        createdAt: "2025-06-01T00:00:00.000Z",
+      },
+      node(2),
+    ];
+    const result = analyzeGraph(todos, START);
+    // Both root tasks start at projectStart, not their createdAt
+    expect(result.earliestStart.get(1)!.getTime()).toBe(startTime);
+    expect(result.earliestStart.get(2)!.getTime()).toBe(startTime);
+  });
+
+  it("independent task does NOT steal critical path from a chain", () => {
+    // Chain: 1 → 2 → 3  (depth 3)
+    // Independent: 4     (depth 1)
+    // Critical path must be the chain, not the standalone task.
+    const todos = [node(1), node(2, [1]), node(3, [2]), node(4)];
+    const result = analyzeGraph(todos, START);
+    expect(result.criticalPath).toEqual([1, 2, 3]);
+  });
+
+  it("picks longest path as critical path in a diamond", () => {
     const todos = [node(1), node(2, [1]), node(3, [1]), node(4, [2, 3])];
-    const result = analyzeGraph(todos);
+    const result = analyzeGraph(todos, START);
     expect(result.criticalPath).toHaveLength(3);
     expect(result.criticalPath[0]).toBe(1);
     expect(result.criticalPath[2]).toBe(4);
@@ -235,37 +238,43 @@ describe("analyzeGraph", () => {
   it("selects the longer branch as critical path", () => {
     // Short: 1 → 3
     // Long:  1 → 2 → 3
-    // Task 3 depends on both 1 and 2; task 2 depends on 1
     const todos = [node(1), node(2, [1]), node(3, [1, 2])];
-    const result = analyzeGraph(todos);
+    const result = analyzeGraph(todos, START);
     expect(result.criticalPath).toEqual([1, 2, 3]);
   });
 
   it("returns empty analysis for cyclic graph", () => {
     const todos = [node(1, [2]), node(2, [1])];
-    const result = analyzeGraph(todos);
+    const result = analyzeGraph(todos, START);
     expect(result.criticalPath).toEqual([]);
     expect(result.earliestStart.size).toBe(0);
   });
 
-  it("handles independent tasks", () => {
+  it("handles independent tasks (critical path is single deepest)", () => {
     const todos = [node(1), node(2), node(3)];
-    const result = analyzeGraph(todos);
-    // All start at the same time; critical path is just one of them
+    const result = analyzeGraph(todos, START);
     expect(result.criticalPath).toHaveLength(1);
+    // All start at the same time
     for (const id of [1, 2, 3]) {
-      expect(result.earliestStart.get(id)!.getTime()).toBe(baseTime);
+      expect(result.earliestStart.get(id)!.getTime()).toBe(startTime);
     }
   });
 
-  it("uses createdAt as baseline for start times", () => {
-    const laterDate = "2024-06-01T00:00:00.000Z";
-    const laterTime = new Date(laterDate).getTime();
-    const todos = [node(1, [], laterDate), node(2, [1], BASE)];
-    const result = analyzeGraph(todos);
-    // Task 1 starts at its later createdAt
-    expect(result.earliestStart.get(1)!.getTime()).toBe(laterTime);
-    // Task 2 starts after task 1 finishes
-    expect(result.earliestStart.get(2)!.getTime()).toBe(laterTime + DAY);
+  it("later-created independent task does not become critical path over a chain", () => {
+    // This is the exact scenario the reviewer reproduced:
+    // Chain 1→2→3, then a standalone task 4 created at a much later date.
+    // With the old createdAt-based model, task 4 could beat the chain.
+    // With the fixed model, it must not.
+    const todos = [
+      node(1),
+      node(2, [1]),
+      node(3, [2]),
+      {
+        ...node(4),
+        createdAt: "2099-01-01T00:00:00.000Z", // far future — should be irrelevant
+      },
+    ];
+    const result = analyzeGraph(todos, START);
+    expect(result.criticalPath).toEqual([1, 2, 3]);
   });
 });

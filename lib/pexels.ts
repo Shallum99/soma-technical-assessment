@@ -1,6 +1,6 @@
 export async function searchPexelsImage(query: string): Promise<string | null> {
   const apiKey = process.env.PEXELS_API_KEY;
-  if (!apiKey || apiKey === "your_pexels_api_key_here") {
+  if (!apiKey || apiKey === "your_key_here") {
     return null;
   }
 
@@ -9,6 +9,7 @@ export async function searchPexelsImage(query: string): Promise<string | null> {
       `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=1`,
       {
         headers: { Authorization: apiKey },
+        signal: AbortSignal.timeout(5000),
       }
     );
 

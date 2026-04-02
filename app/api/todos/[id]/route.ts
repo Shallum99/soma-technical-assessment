@@ -18,7 +18,7 @@ export async function DELETE(request: Request, { params }: Params) {
       where: { id },
     });
     return NextResponse.json({ message: 'Todo deleted' }, { status: 200 });
-  } catch (error) {
+  } catch {
     return NextResponse.json({ error: 'Error deleting todo' }, { status: 500 });
   }
 }
@@ -32,9 +32,17 @@ export async function PATCH(request: Request, { params }: Params) {
   try {
     const body = await request.json();
     const data: { title?: string; completed?: boolean; dueDate?: Date | null } = {};
-    if (body.title !== undefined) data.title = body.title;
+
+    if (body.title !== undefined) {
+      if (typeof body.title !== 'string' || body.title.trim() === '') {
+        return NextResponse.json({ error: 'Title cannot be empty' }, { status: 400 });
+      }
+      data.title = body.title.trim();
+    }
     if (body.completed !== undefined) data.completed = body.completed;
-    if (body.dueDate !== undefined) data.dueDate = body.dueDate ? new Date(body.dueDate + "T12:00:00") : null;
+    if (body.dueDate !== undefined) {
+      data.dueDate = body.dueDate ? new Date(body.dueDate + "T23:59:59") : null;
+    }
 
     const todo = await prisma.todo.update({
       where: { id },
@@ -45,7 +53,7 @@ export async function PATCH(request: Request, { params }: Params) {
       },
     });
     return NextResponse.json(todo);
-  } catch (error) {
+  } catch {
     return NextResponse.json({ error: 'Error updating todo' }, { status: 500 });
   }
 }

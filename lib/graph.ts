@@ -53,8 +53,16 @@ export interface GraphAnalysis {
   criticalPath: number[];
 }
 
-/** Forward-pass schedule + critical path computation */
-export function analyzeGraph(todos: TodoNode[]): GraphAnalysis {
+/**
+ * Forward-pass schedule + critical path computation.
+ *
+ * All root tasks (no dependencies) start at `projectStart` so the critical
+ * path is determined purely by graph structure, not task creation order.
+ */
+export function analyzeGraph(
+  todos: TodoNode[],
+  projectStart: Date = new Date()
+): GraphAnalysis {
   const empty: GraphAnalysis = {
     earliestStart: new Map(),
     earliestFinish: new Map(),
@@ -68,13 +76,15 @@ export function analyzeGraph(todos: TodoNode[]): GraphAnalysis {
   const sorted = topologicalSort(todos);
   if (!sorted) return empty;
 
-  // Forward pass: compute earliest start/finish for each task
+  // Forward pass: compute earliest start/finish for each task.
+  // Root tasks all share the same baseline so the critical path
+  // reflects dependency depth, not insertion order.
   const earliestStart = new Map<number, Date>();
   const earliestFinish = new Map<number, Date>();
 
   for (const id of sorted) {
     const todo = todoMap.get(id)!;
-    let es = new Date(todo.createdAt);
+    let es = projectStart;
 
     for (const dep of todo.dependsOn) {
       const depFinish = earliestFinish.get(dep.dependsOnId);

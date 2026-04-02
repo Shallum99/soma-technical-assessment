@@ -36,6 +36,7 @@ import { DependencyGraph } from "@/components/dependency-graph";
 import { analyzeGraph, canReach } from "@/lib/graph";
 import {
   createTodo,
+  loadTodoImage,
   deleteTodo,
   toggleTodo,
   removeDependency,
@@ -46,15 +47,9 @@ import type { Todo, SortField, SortDir } from "@/lib/types";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/** Compare date portions only (ignoring time) so "due today" is not overdue */
-const isOverdue = (d: string) => {
-  const due = new Date(d);
-  const now = new Date();
-  return (
-    new Date(due.getFullYear(), due.getMonth(), due.getDate()) <
-    new Date(now.getFullYear(), now.getMonth(), now.getDate())
-  );
-};
+/** Due date is past the current time — stored as end-of-day so this
+ *  triggers the morning after the due date. */
+const isOverdue = (d: string) => new Date(d) < new Date();
 
 const formatDate = (d: string) =>
   new Date(d).toLocaleDateString("en-US", {
@@ -86,7 +81,6 @@ function ImageWithSkeleton({
   const [error, setError] = useState(false);
   const imgRef = useRef<HTMLImageElement>(null);
 
-  // Handle cached images where onLoad fires before React mounts
   useEffect(() => {
     if (imgRef.current?.complete && imgRef.current?.naturalHeight > 0) {
       setLoaded(true);
@@ -162,6 +156,33 @@ function CriticalPathSummary({
   );
 }
 
+// ─── Thumbnail ──────────────────────────────────────────────────────────────
+function TodoThumbnail({
+  todo,
+  isImageLoading,
+}: {
+  todo: Todo;
+  isImageLoading: boolean;
+}) {
+  if (todo.imageUrl) {
+    return (
+      <ImageWithSkeleton
+        src={todo.imageUrl}
+        alt={todo.title}
+        className="w-10 h-10"
+      />
+    );
+  }
+  if (isImageLoading) {
+    return <div className="w-10 h-10 bg-gray-200 animate-pulse rounded" />;
+  }
+  return (
+    <div className="w-10 h-10 bg-gray-100 rounded flex items-center justify-center">
+      <ImageIcon className="h-4 w-4 text-gray-400" />
+    </div>
+  );
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
   const [todos, setTodos] = useState<Todo[]>(initialTodos);
@@ -177,6 +198,9 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
   const [depLoading, setDepLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
+  const [imageLoadingIds, setImageLoadingIds] = useState<Set<number>>(
+    new Set()
+  );
   const [isPending, startTransition] = useTransition();
 
   // nuqs — URL-persisted state
@@ -235,6 +259,29 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
     return map;
   }, [todos]);
 
+  // ── Available deps — computed only for the expanded row ────────────────────
+  const availableDeps = useMemo(() => {
+    if (expandedId === null) return [];
+    const expandedTodo = todos.find((t) => t.id === expandedId);
+    if (!expandedTodo) return [];
+    const existingDepIds = new Set(
+      expandedTodo.dependsOn.map((d) => d.dependsOnId)
+    );
+    return todos.filter((t) => {
+      if (t.id === expandedId) return false;
+      if (existingDepIds.has(t.id)) return false;
+      if (canReach(t.id, expandedId, adjacency)) return false;
+      return true;
+    });
+  }, [expandedId, todos, adjacency]);
+
+  const filteredDeps = useMemo(() => {
+    if (!depSearch) return availableDeps;
+    return availableDeps.filter((t) =>
+      t.title.toLowerCase().includes(depSearch.toLowerCase())
+    );
+  }, [availableDeps, depSearch]);
+
   // ── Filtered + sorted todos ────────────────────────────────────────────────
   const filteredTodos = useMemo(() => {
     if (statusFilter === "pending") return todos.filter((t) => !t.completed);
@@ -261,7 +308,6 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
     return copy;
   }, [filteredTodos, sortField, sortDir]);
 
-  // Counts for filter badges
   const pendingCount = todos.filter((t) => !t.completed).length;
   const completedCount = todos.filter((t) => t.completed).length;
 
@@ -276,36 +322,57 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
   };
 
   const handleAdd = async () => {
-    if (!newTitle.trim()) return;
+    const title = newTitle.trim();
+    if (!title) return;
     setLoading(true);
     setError(null);
     try {
-      const result = await createTodo(newTitle, newDueDate || null);
+      const result = await createTodo(title, newDueDate || null);
       if ("error" in result) {
         setError(result.error!);
-      } else {
-        setNewTitle("");
-        setNewDueDate("");
-        await refresh();
+        setLoading(false);
+        return;
       }
+      const todoId = result.todo.id;
+      setNewTitle("");
+      setNewDueDate("");
+      setLoading(false);
+
+      // Show the new todo immediately with an image loading skeleton
+      setImageLoadingIds((prev) => new Set(prev).add(todoId));
+      await refresh();
+
+      // Fetch image in the background — the todo item shows a
+      // loading state in the meantime (satisfies Part 2 spec).
+      try {
+        await loadTodoImage(todoId, title);
+      } catch {
+        // Image fetch failure is non-critical
+      }
+      setImageLoadingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(todoId);
+        return next;
+      });
+      await refresh();
     } catch {
       setError("Failed to add todo.");
-    } finally {
       setLoading(false);
     }
   };
 
   const handleToggle = (id: number, completed: boolean) => {
-    const previousTodos = todos;
-    // Optimistic update
+    // Optimistic update — rollback the specific field on failure,
+    // not a stale snapshot, so overlapping toggles are safe.
     setTodos((prev) =>
       prev.map((t) => (t.id === id ? { ...t, completed } : t))
     );
     startTransition(async () => {
       const result = await toggleTodo(id, completed);
       if (result.error) {
-        // Rollback on failure
-        setTodos(previousTodos);
+        setTodos((prev) =>
+          prev.map((t) => (t.id === id ? { ...t, completed: !completed } : t))
+        );
         setError(result.error);
         return;
       }
@@ -373,6 +440,9 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
       return next;
     });
   };
+
+  const toggleExpanded = (id: number) =>
+    setExpandedId((prev) => (prev === id ? null : id));
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
@@ -443,10 +513,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
           >
             <AlertTriangle className="h-4 w-4 flex-shrink-0" />
             <span className="flex-grow">{error}</span>
-            <button
-              onClick={() => setError(null)}
-              aria-label="Dismiss error"
-            >
+            <button onClick={() => setError(null)} aria-label="Dismiss error">
               <X className="h-4 w-4" />
             </button>
           </div>
@@ -460,9 +527,12 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
               <TabsTrigger value="dependencies">Dependencies</TabsTrigger>
             </TabsList>
 
-            {/* Status filter (only on tasks tab) */}
             {(tab === "tasks" || !tab) && (
-              <div className="flex gap-1" role="group" aria-label="Filter tasks by status">
+              <div
+                className="flex gap-1"
+                role="group"
+                aria-label="Filter tasks by status"
+              >
                 {(
                   [
                     ["all", "All", todos.length],
@@ -503,16 +573,13 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                 <div className="overflow-x-auto">
                   <div className="min-w-[640px]">
                     {/* Table header */}
-                    <div
-                      className="grid grid-cols-[32px_48px_1fr_140px_140px_48px] gap-2 px-4 py-3 border-b bg-gray-50 text-xs font-medium text-muted-foreground uppercase tracking-wider"
-                      role="row"
-                    >
+                    <div className="grid grid-cols-[32px_48px_1fr_140px_140px_48px] gap-2 px-4 py-3 border-b bg-gray-50 text-xs font-medium text-muted-foreground uppercase tracking-wider">
                       <span />
                       <span />
                       <button
                         className="text-left flex items-center hover:text-foreground"
                         onClick={() => handleSort("title")}
-                        aria-label={`Sort by title ${sortField === "title" ? (sortDir === "asc" ? "descending" : "ascending") : "ascending"}`}
+                        aria-label={`Sort by title`}
                       >
                         Task
                         <SortIndicator
@@ -524,7 +591,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                       <button
                         className="text-left flex items-center hover:text-foreground"
                         onClick={() => handleSort("dueDate")}
-                        aria-label={`Sort by due date ${sortField === "dueDate" ? (sortDir === "asc" ? "descending" : "ascending") : "ascending"}`}
+                        aria-label={`Sort by due date`}
                       >
                         Due Date
                         <SortIndicator
@@ -536,7 +603,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                       <button
                         className="text-left flex items-center hover:text-foreground"
                         onClick={() => handleSort("createdAt")}
-                        aria-label={`Sort by created date ${sortField === "createdAt" ? (sortDir === "asc" ? "descending" : "ascending") : "ascending"}`}
+                        aria-label={`Sort by created date`}
                       >
                         Created
                         <SortIndicator
@@ -553,24 +620,7 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                       const expanded = expandedId === todo.id;
                       const onCritical = criticalSet.has(todo.id);
                       const es = earliestStart.get(todo.id);
-
-                      const existingDepIds = new Set(
-                        todo.dependsOn.map((d) => d.dependsOnId)
-                      );
-                      const availableDeps = todos.filter((t) => {
-                        if (t.id === todo.id) return false;
-                        if (existingDepIds.has(t.id)) return false;
-                        if (canReach(t.id, todo.id, adjacency)) return false;
-                        return true;
-                      });
-
-                      const filteredDeps = depSearch
-                        ? availableDeps.filter((t) =>
-                            t.title
-                              .toLowerCase()
-                              .includes(depSearch.toLowerCase())
-                          )
-                        : availableDeps;
+                      const isImgLoading = imageLoadingIds.has(todo.id);
 
                       return (
                         <div
@@ -582,11 +632,17 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                           {/* Main row */}
                           <div
                             className={`grid grid-cols-[32px_48px_1fr_140px_140px_48px] gap-2 px-4 py-3 items-center hover:bg-gray-50/50 cursor-pointer ${isPending ? "opacity-70" : ""}`}
-                            onClick={() =>
-                              setExpandedId(expanded ? null : todo.id)
-                            }
-                            role="row"
+                            onClick={() => toggleExpanded(todo.id)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                toggleExpanded(todo.id);
+                              }
+                            }}
+                            role="button"
+                            tabIndex={0}
                             aria-expanded={expanded}
+                            aria-label={`${todo.title}, click to ${expanded ? "collapse" : "expand"} details`}
                           >
                             {/* Completion toggle */}
                             <button
@@ -614,17 +670,10 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
 
                             {/* Thumbnail */}
                             <div className="w-10 h-10 rounded overflow-hidden flex-shrink-0">
-                              {todo.imageUrl ? (
-                                <ImageWithSkeleton
-                                  src={todo.imageUrl}
-                                  alt={todo.title}
-                                  className="w-10 h-10"
-                                />
-                              ) : (
-                                <div className="w-10 h-10 bg-gray-100 rounded flex items-center justify-center">
-                                  <ImageIcon className="h-4 w-4 text-gray-400" />
-                                </div>
-                              )}
+                              <TodoThumbnail
+                                todo={todo}
+                                isImageLoading={isImgLoading}
+                              />
                             </div>
 
                             {/* Title + badges */}
@@ -746,6 +795,8 @@ export function TodoApp({ initialTodos }: { initialTodos: Todo[] }) {
                                         </p>
                                       </DialogContent>
                                     </Dialog>
+                                  ) : isImgLoading ? (
+                                    <div className="w-full h-48 bg-gray-200 animate-pulse rounded-lg border" />
                                   ) : (
                                     <div className="w-full h-48 bg-gray-100 rounded-lg flex items-center justify-center border">
                                       <span className="text-sm text-muted-foreground">

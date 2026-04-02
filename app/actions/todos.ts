@@ -27,19 +27,32 @@ export async function createTodo(title: string, dueDate: string | null) {
     return { error: `Title must be ${MAX_TITLE_LENGTH} characters or fewer` };
   }
 
-  const imageUrl = await searchPexelsImage(title.trim());
-
+  // Create the todo immediately WITHOUT waiting for Pexels.
+  // The image is fetched separately via loadTodoImage so the
+  // todo item can show a loading state in the UI.
   const todo = await prisma.todo.create({
     data: {
       title: title.trim(),
-      dueDate: dueDate ? new Date(dueDate + "T12:00:00") : null,
-      imageUrl,
+      dueDate: dueDate ? new Date(dueDate + "T23:59:59") : null,
     },
     include: todoInclude,
   });
 
   revalidatePath("/");
   return { todo };
+}
+
+/** Fetch a Pexels image for an existing todo and persist it. */
+export async function loadTodoImage(todoId: number, query: string) {
+  const imageUrl = await searchPexelsImage(query.trim());
+  if (imageUrl) {
+    await prisma.todo.update({
+      where: { id: todoId },
+      data: { imageUrl },
+    });
+  }
+  revalidatePath("/");
+  return { imageUrl };
 }
 
 export async function deleteTodo(id: number) {

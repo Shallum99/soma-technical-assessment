@@ -66,10 +66,12 @@ npm install
 
 Create a `.env.local` file with your Pexels API key:
 
-```
+```env
 DATABASE_URL="file:./dev.db"
 PEXELS_API_KEY=your_key_here
 ```
+
+> The Pexels key sentinel in the code checks for exactly `your_key_here`, so leave that placeholder as-is until you replace it with a real key.
 
 Run the development server:
 
@@ -114,15 +116,14 @@ npm test
 - Added an optional `dueDate` field to the Todo model via Prisma migration.
 - Inline date picker in the task creation row with `maxLength` validation.
 - Sortable due date column — click the header to toggle ascending/descending.
-- Overdue dates are highlighted in **red** with a warning icon. The comparison uses date-only logic (ignoring time) so a task due "today" does not appear overdue until tomorrow.
+- Due dates are stored as end-of-day (23:59:59). Overdue detection compares the stored timestamp against the current time, so a task due "today" is shown in **red** with a warning icon starting the following morning.
 
 ### Part 2: Image Previews (Pexels API)
 
-- When a todo is created, the server action queries the Pexels API using the task title as a search query.
-- The first matching image URL is stored in the database and displayed as an **inline thumbnail** in each task row.
-- An **animated skeleton placeholder** is shown while each image loads, with a smooth opacity transition on completion. Handles cached images that fire `onLoad` before React mounts.
+- Todo creation is a two-step process: the task row is inserted and returned immediately, then the Pexels image is fetched asynchronously via a separate `loadTodoImage` server action. This keeps creation fast and allows the **todo item itself** to display an animated skeleton placeholder while the image search runs.
+- Once the Pexels response arrives, the image URL is persisted and the UI refreshes to show the inline thumbnail.
 - Clicking the thumbnail in the expanded row opens a **full-size preview dialog** (Radix Dialog).
-- An **animated spinner** is shown on the Add button while the task and image are being fetched.
+- The Pexels fetch has a **5-second timeout** so task creation is never blocked indefinitely by an external API.
 - The Pexels API key is stored in `.env.local` and only accessed server-side — never exposed to the client.
 
 ### Part 3: Task Dependencies
@@ -135,7 +136,7 @@ npm test
   - **Client-side**: DFS reachability check (`canReach`) filters invalid options out of the picker entirely, so users never see an option that would create a cycle.
   - **Server-side**: `wouldCreateCycle` loads all edges in a single query and runs an in-memory BFS check before creating the dependency. Returns a clear error if a cycle would result.
 
-- **Critical path**: Computed using Kahn's topological sort with a forward pass to calculate earliest start/finish times, then iterative traceback from the latest-finishing task to identify the longest dependency chain. Critical path tasks are highlighted with orange badges and row tinting. A summary strip below the table shows the full critical path sequence.
+- **Critical path**: All root tasks (no dependencies) share a common project-start baseline, so the critical path is determined purely by dependency-graph depth — not task creation order. Computed via Kahn's topological sort, a forward pass for earliest start/finish, and iterative traceback from the latest-finishing task. Critical path tasks are highlighted with orange badges and row tinting.
 
 - **Earliest start dates**: Calculated per task based on its dependency chain (each task assumed to take 1 day). Displayed in the expanded row for tasks with dependencies, along with a warning about critical path impact.
 
@@ -164,7 +165,7 @@ npm test
 - **`topologicalSort`** — empty input, single node, linear chains, diamond dependencies, cycles, multiple independent chains, multi-dependency nodes
 - **`canReach`** — direct edges, transitive paths, unreachable nodes, reverse direction, cycle handling
 - **`wouldCreateCycle`** — no edges, direct back-edges, transitive cycles, parallel chains, diamond cycles
-- **`analyzeGraph`** — empty input, single-node critical path, linear chains, earliest start calculation, diamond path selection, longer branch selection, cyclic input, independent tasks, `createdAt` baseline handling
+- **`analyzeGraph`** — empty input, single-node critical path, linear chains, earliest start calculation, diamond path selection, longer branch selection, cyclic input, independent tasks, fixed baseline verification, proof that later-created independent tasks cannot steal the critical path from a dependency chain
 
 ```bash
 npm test          # run once

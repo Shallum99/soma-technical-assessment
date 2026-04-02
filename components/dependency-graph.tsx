@@ -221,7 +221,7 @@ export function DependencyGraph({ todos, criticalPath }: DependencyGraphProps) {
   }
 
   return (
-    <div className="w-full h-[500px] border rounded-lg bg-white" role="img" aria-label="Task dependency graph">
+    <div className="w-full h-[500px] border rounded-lg bg-white" aria-label="Interactive task dependency graph">
       <ReactFlow
         nodes={nodes}
         edges={edges}
